@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IDIOTS PLAY GAMES — Voice Chat</title>
+  <link rel="stylesheet" href="/css/style.css?v=3">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+  <!-- LOGIN SCREEN -->
+  <div id="login-screen" class="screen active">
+    <div class="login-card">
+      <div class="login-logo">🎮</div>
+      <h1>IDIOTS PLAY GAMES</h1>
+      <p class="login-subtitle">Voice &amp; Text Chat</p>
+      <div class="login-form">
+        <input type="text" id="username-input" placeholder="Enter your username" autocomplete="off" maxlength="30">
+        <button id="login-btn" class="btn btn-primary">Connect</button>
+      </div>
+      <div id="login-error" class="error-msg hidden"></div>
+      <p class="login-info">No password needed — just pick a name and jump in!</p>
+    </div>
+  </div>
+
+  <!-- MAIN CHAT SCREEN -->
+  <div id="chat-screen" class="screen">
+    <!-- Sidebar -->
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <h2>🎮 IPG</h2>
+        <span id="connection-status" class="status-dot disconnected" title="Disconnected"></span>
+      </div>
+
+      <!-- Channels -->
+      <div class="sidebar-section">
+        <h3>Channels</h3>
+        <ul id="channel-list" class="channel-list"></ul>
+      </div>
+
+      <!-- Online Users -->
+      <div class="sidebar-section">
+        <h3>Online <span id="user-count" class="badge">0</span></h3>
+        <ul id="user-list" class="user-list"></ul>
+      </div>
+
+      <!-- Voice Controls -->
+      <div class="sidebar-section voice-section">
+        <h3>Voice</h3>
+        <div class="voice-controls">
+          <button id="voice-connect-btn" class="btn btn-voice" title="Connect to voice">
+            <span class="voice-icon">🎤</span>
+            <span class="voice-label">Join Voice</span>
+          </button>
+          <div id="voice-active-controls" class="hidden">
+            <button id="mute-btn" class="btn btn-voice-sm" title="Mute">🎤</button>
+            <button id="deafen-btn" class="btn btn-voice-sm" title="Deafen">🔊</button>
+            <button id="voice-disconnect-btn" class="btn btn-voice-sm btn-danger" title="Disconnect voice">📵</button>
+          </div>
+          <div id="voice-status" class="voice-status">Not connected</div>
+        </div>
+      </div>
+
+      <!-- User Controls -->
+      <div class="sidebar-footer">
+        <div class="user-controls">
+          <span id="my-username" class="my-name"></span>
+          <button id="disconnect-btn" class="btn btn-small btn-danger" title="Disconnect">✕</button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main id="main-content">
+      <!-- Channel Header -->
+      <div id="channel-header">
+        <h2 id="current-channel-name">#Root</h2>
+        <div class="header-actions">
+          <button id="header-voice-btn" class="btn btn-voice-header" title="Join voice chat">🎤 Join Voice</button>
+          <span id="header-voice-status" class="header-voice-status hidden"></span>
+          <button id="toggle-sidebar-btn" class="btn btn-icon" title="Toggle sidebar">☰</button>
+        </div>
+      </div>
+
+      <!-- Messages -->
+      <div id="messages-container">
+        <div id="messages" role="log" aria-live="polite"></div>
+        <div id="typing-indicator" class="hidden">
+          <span class="typing-dots"><span>.</span><span>.</span><span>.</span></span>
+        </div>
+      </div>
+
+      <!-- Activity Feed (joins, leaves, voice events) -->
+      <div id="activity-panel" class="collapsed">
+        <div id="activity-header">
+          <span>Activity</span>
+          <button id="activity-toggle" class="btn btn-icon" title="Toggle activity feed">▼</button>
+        </div>
+        <div id="activity-feed" role="log"></div>
+      </div>
+
+      <!-- Input Bar -->
+      <div id="input-bar">
+        <div class="input-wrapper">
+          <input type="text" id="message-input" placeholder="Type a message..." autocomplete="off" maxlength="2000" disabled>
+          <button id="send-btn" class="btn btn-primary" disabled>Send</button>
+        </div>
+        <div class="input-hints">
+          <span>Type <code>!help</code> for bot commands</span>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/js/chat.js?v=3"></script>
+</body>
+</html>

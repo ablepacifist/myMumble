@@ -1,0 +1,34 @@
+{
+  "name": "mumble-bridge",
+  "version": "1.0.0",
+  "description": "Bridge service connecting Mumble voice server to web clients and Lexicon API",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node tests/run-all.js",
+    "test:http": "node tests/test-http-server.js",
+    "test:ws": "node tests/test-ws-connect.js",
+    "test:voice": "node tests/test-voice-bridge.js",
+    "test:e2e": "node tests/test-two-clients.js",
+    "test:3way": "node tests/test-three-clients.js",
+    "test:stability": "node tests/test-stability.js",
+    "test:live": "node tests/test-live.js"
+  },
+  "keywords": [
+    "mumble",
+    "websocket",
+    "bridge",
+    "voip"
+  ],
+  "author": "alex",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "mysql2": "^3.17.1",
+    "node-fetch": "^2.7.0",
+    "opusscript": "^0.1.1",
+    "protobufjs": "^8.0.0",
+    "ws": "^8.19.0"
+  }
+}
