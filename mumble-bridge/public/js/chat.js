@@ -19,6 +19,10 @@
   let pollTimer = null;
   const POLL_INTERVAL = 5000; // refresh messages every 5 seconds
   const seenMessageIds = new Set(); // dedup messages by id
+  const ACTIVITY_CHANNEL_ID = '__activity__'; // Virtual channel for activity feed
+  let activityMessages = []; // Stored activity messages for the virtual channel
+  const speakingUsers = new Set(); // webClientIds currently speaking
+  const speakingTimers = new Map(); // debounce timers for speaking indicators
 
   // ── DOM refs ─────────────────────────────────────────────
   const $ = (sel) => document.querySelector(sel);
@@ -40,10 +44,11 @@
   const messageInput  = $('#message-input');
   const sendBtn       = $('#send-btn');
   const statusDot     = $('#connection-status');
-  const activityPanel  = $('#activity-panel');
-  const activityToggle = $('#activity-toggle');
-  const activityHeader = $('#activity-header');
-  const activityFeed   = $('#activity-feed');
+  const addChannelBtn  = $('#add-channel-btn');
+  const channelDialog  = $('#channel-dialog');
+  const channelNameInput = $('#channel-name-input');
+  const channelSaveBtn = $('#channel-save-btn');
+  const channelCancelBtn = $('#channel-cancel-btn');
 
   // ── Helpers ──────────────────────────────────────────────
   function setStatus(state) {
@@ -300,15 +305,29 @@
         console.log('[Voice] Server confirmed voice session stopped');
         break;
 
+      case 'voice_speaking':
+        // Speaking indicator from server
+        if (msg.id) {
+          if (msg.speaking) {
+            speakingUsers.add(msg.id);
+          } else {
+            speakingUsers.delete(msg.id);
+          }
+          renderUsers();
+        }
+        break;
+
       case 'text':
         addChatMessage(msg);
         break;
 
       case 'history': {
         if (msg.messages && msg.messages.length > 0) {
-          // Deduplicate by message id
+          // Deduplicate using normalized key (same as addChatMessage)
           const newMsgs = msg.messages.filter(m => {
-            const key = m.id || (m.senderName || m.username) + '|' + (m.createdAt || m.sentAt || m.timestamp) + '|' + (m.content || m.text);
+            const name = m.senderName || m.username || '';
+            const text = m.content || m.text || '';
+            const key = m.id ? String(m.id) : dedupKey(name, text);
             if (seenMessageIds.has(key)) return false;
             seenMessageIds.add(key);
             return true;
@@ -333,7 +352,10 @@
               }, true);
             });
         }
-        scrollToBottom();
+        // Only auto-scroll on initial load, never on poll refreshes
+        if (!msg._isRefresh) {
+          scrollToBottom();
+        }
         break;
       }
 
@@ -404,6 +426,14 @@
       li.addEventListener('click', () => joinChannel(ch.id));
       channelList.appendChild(li);
     });
+
+    // Activity virtual channel (always at the bottom)
+    const actLi = document.createElement('li');
+    actLi.className = 'activity-channel';
+    actLi.textContent = '📋 Activity';
+    if (currentChannelId === ACTIVITY_CHANNEL_ID) actLi.classList.add('active');
+    actLi.addEventListener('click', () => joinChannel(ACTIVITY_CHANNEL_ID));
+    channelList.appendChild(actLi);
   }
 
   function renderUsers() {
@@ -427,6 +457,7 @@
       voiceMembers.forEach(wc => {
         const li = document.createElement('li');
         li.className = 'user-item in-voice';
+        if (speakingUsers.has(wc.id)) li.classList.add('speaking');
         const dot = document.createElement('span');
         dot.className = 'user-avatar voice';
         li.appendChild(dot);
@@ -484,6 +515,48 @@
 
   function joinChannel(chId) {
     currentChannelId = chId;
+
+    if (chId === ACTIVITY_CHANNEL_ID) {
+      // Virtual activity channel — show stored activity messages
+      channelHeader.textContent = '📋 Activity';
+      renderChannels();
+      messagesEl.innerHTML = '';
+      seenMessageIds.clear();
+
+      // Render stored activity messages
+      activityMessages.forEach(am => {
+        const div = document.createElement('div');
+        div.className = 'message system-msg';
+        const header = document.createElement('div');
+        header.className = 'msg-header';
+        const time = document.createElement('span');
+        time.className = 'msg-time';
+        time.textContent = formatTime(am.timestamp);
+        header.appendChild(time);
+        const text = document.createElement('div');
+        text.className = 'msg-text';
+        text.textContent = am.text;
+        div.appendChild(header);
+        div.appendChild(text);
+        messagesEl.appendChild(div);
+      });
+      scrollToBottom();
+
+      // Stop polling (activity channel doesn't use server history)
+      stopPolling();
+      // Hide input bar (read-only channel)
+      messageInput.disabled = true;
+      sendBtn.disabled = true;
+      messageInput.placeholder = 'Activity feed is read-only';
+      sidebar.classList.remove('open');
+      return;
+    }
+
+    // Normal channel
+    messageInput.disabled = false;
+    sendBtn.disabled = false;
+    messageInput.placeholder = 'Type a message...';
+
     send({ type: 'join_channel', channelId: chId });
     const ch = channels.get(chId);
     channelHeader.textContent = '#' + (ch ? ch.name : 'Unknown');
@@ -502,11 +575,17 @@
   }
 
   // ── Chat Messages ────────────────────────────────────────
+
+  /** Normalize dedup key: username + clean text (timestamps differ between sources) */
+  function dedupKey(name, text) {
+    return (name || '').toLowerCase() + '|' + stripHtml(text || '').toLowerCase().trim();
+  }
+
   function addChatMessage(msg, isHistory) {
     // Dedup real-time messages too
-    const dedupKey = msg.id || (msg.username || '') + '|' + (msg.timestamp || '') + '|' + stripHtml(msg.text || '');
-    if (seenMessageIds.has(dedupKey)) return;
-    seenMessageIds.add(dedupKey);
+    const key = msg.id ? String(msg.id) : dedupKey(msg.username, msg.text);
+    if (seenMessageIds.has(key)) return;
+    seenMessageIds.add(key);
 
     const div = document.createElement('div');
     div.className = 'message';
@@ -570,31 +649,36 @@
   }
 
   /**
-   * Add a message to the activity feed (joins, leaves, voice events).
+   * Add a message to the activity feed (virtual Activity channel).
+   * If the user is currently viewing Activity, render it immediately.
    */
   function addActivityMessage(text) {
-    const div = document.createElement('div');
-    div.className = 'activity-item';
+    const timestamp = new Date().toISOString();
+    activityMessages.push({ text, timestamp });
 
-    const timeEl = document.createElement('span');
-    timeEl.className = 'activity-time';
-    timeEl.textContent = formatTime(new Date().toISOString());
+    // Keep only last 100 activity items
+    while (activityMessages.length > 100) activityMessages.shift();
 
-    const textEl = document.createElement('span');
-    textEl.className = 'activity-text';
-    textEl.textContent = text;
+    // If currently viewing Activity channel, render it
+    if (currentChannelId === ACTIVITY_CHANNEL_ID) {
+      const div = document.createElement('div');
+      div.className = 'message system-msg';
+      const header = document.createElement('div');
+      header.className = 'msg-header';
+      const time = document.createElement('span');
+      time.className = 'msg-time';
+      time.textContent = formatTime(timestamp);
+      header.appendChild(time);
+      const textEl = document.createElement('div');
+      textEl.className = 'msg-text';
+      textEl.textContent = text;
+      div.appendChild(header);
+      div.appendChild(textEl);
+      messagesEl.appendChild(div);
 
-    div.appendChild(timeEl);
-    div.appendChild(textEl);
-    activityFeed.appendChild(div);
-
-    // Keep only last 50 activity items
-    while (activityFeed.children.length > 50) {
-      activityFeed.removeChild(activityFeed.firstChild);
+      const threshold = msgContainer.scrollHeight - msgContainer.scrollTop - msgContainer.clientHeight;
+      if (threshold < 150) scrollToBottom();
     }
-
-    // Auto-scroll activity feed
-    activityFeed.scrollTop = activityFeed.scrollHeight;
   }
 
   // ── Send Message ─────────────────────────────────────────
@@ -659,9 +743,30 @@
     sidebar.classList.toggle('open');
   });
 
-  // Activity panel toggle
-  activityHeader.addEventListener('click', () => {
-    activityPanel.classList.toggle('collapsed');
+  // ── Channel Management ───────────────────────────────────
+  addChannelBtn.addEventListener('click', () => {
+    channelDialog.classList.toggle('hidden');
+    if (!channelDialog.classList.contains('hidden')) {
+      channelNameInput.value = '';
+      channelNameInput.focus();
+    }
+  });
+
+  channelCancelBtn.addEventListener('click', () => {
+    channelDialog.classList.add('hidden');
+  });
+
+  channelSaveBtn.addEventListener('click', () => {
+    const name = channelNameInput.value.trim();
+    if (name) {
+      send({ type: 'create_channel', name, parentId: 0 });
+      channelDialog.classList.add('hidden');
+    }
+  });
+
+  channelNameInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') channelSaveBtn.click();
+    if (e.key === 'Escape') channelCancelBtn.click();
   });
 
   // Close sidebar when clicking outside on mobile

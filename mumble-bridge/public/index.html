@@ -35,8 +35,17 @@
 
       <!-- Channels -->
       <div class="sidebar-section">
-        <h3>Channels</h3>
+        <h3>Channels <button id="add-channel-btn" class="btn-icon-inline" title="Create channel">＋</button></h3>
         <ul id="channel-list" class="channel-list"></ul>
+      </div>
+
+      <!-- Channel Create/Edit Dialog (hidden by default) -->
+      <div id="channel-dialog" class="sidebar-dialog hidden">
+        <input type="text" id="channel-name-input" placeholder="Channel name" maxlength="50">
+        <div class="dialog-actions">
+          <button id="channel-save-btn" class="btn btn-small btn-primary">Create</button>
+          <button id="channel-cancel-btn" class="btn btn-small">Cancel</button>
+        </div>
       </div>
 
       <!-- Online Users -->
@@ -89,15 +98,6 @@
         <div id="typing-indicator" class="hidden">
           <span class="typing-dots"><span>.</span><span>.</span><span>.</span></span>
         </div>
-      </div>
-
-      <!-- Activity Feed (joins, leaves, voice events) -->
-      <div id="activity-panel" class="collapsed">
-        <div id="activity-header">
-          <span>Activity</span>
-          <button id="activity-toggle" class="btn btn-icon" title="Toggle activity feed">▼</button>
-        </div>
-        <div id="activity-feed" role="log"></div>
       </div>
 
       <!-- Input Bar -->
