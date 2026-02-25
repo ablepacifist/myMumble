@@ -106,6 +106,16 @@ class VoiceBridge {
   }
 
   /**
+   * Move a voice session's Mumble user to a specific channel.
+   * @param {string} peerId
+   * @param {number} channelId - The Mumble channel ID to move to
+   */
+  moveToChannel(peerId, channelId) {
+    const session = this.sessions.get(peerId);
+    if (session) session.moveToChannel(channelId);
+  }
+
+  /**
    * Get active session count.
    */
   getStats() {
@@ -140,6 +150,16 @@ class VoiceSession {
     // Using one decoder for all streams produces garbled output.
     this.opusDecoders = new Map(); // senderSession -> { decoder, lastUsed }
     this._decoderCleanupInterval = setInterval(() => this._cleanupIdleDecoders(), 30000);
+
+    // ── Diagnostic counters (temporary) ──
+    this._diag = { pcmIn: 0, opusOut: 0, mumbleIn: 0, pcmOut: 0, encErr: 0, decErr: 0, wsErr: 0, echoSkip: 0 };
+    this._diagInterval = setInterval(() => {
+      const d = this._diag;
+      if (d.pcmIn || d.mumbleIn) {
+        console.log(`[Voice][DIAG] ${this.username}: pcmIn=${d.pcmIn} opusOut=${d.opusOut} mumbleIn=${d.mumbleIn} pcmOut=${d.pcmOut} echoSkip=${d.echoSkip} encErr=${d.encErr} decErr=${d.decErr} wsErr=${d.wsErr}`);
+      }
+      this._diag = { pcmIn: 0, opusOut: 0, mumbleIn: 0, pcmOut: 0, encErr: 0, decErr: 0, wsErr: 0, echoSkip: 0 };
+    }, 5000);
   }
 
   /**
@@ -316,6 +336,13 @@ class VoiceSession {
     if (!parsed || !parsed.opusData || parsed.opusData.length === 0) return;
 
     const { senderSession, opusData } = parsed;
+    this._diag.mumbleIn++;
+
+    // Never play back our own audio — prevents echo feedback loop
+    if (senderSession === this.mumbleSession) {
+      this._diag.echoSkip++;
+      return;
+    }
 
     // Get or create a decoder for this sender
     let entry = this.opusDecoders.get(senderSession);
@@ -325,6 +352,7 @@ class VoiceSession {
         lastUsed: Date.now(),
       };
       this.opusDecoders.set(senderSession, entry);
+      console.log(`[Voice][DIAG] ${this.username}: new decoder for sender session ${senderSession}`);
     }
     entry.lastUsed = Date.now();
 
@@ -334,15 +362,19 @@ class VoiceSession {
       const decoded = entry.decoder.decode(Buffer.from(opusData));
       pcmBuffer = Buffer.from(decoded);
     } catch (err) {
+      this._diag.decErr++;
+      console.error(`[Voice][DIAG] Decode error for ${this.username} from sender ${senderSession}:`, err.message);
       return; // Skip bad frames
     }
 
     // Send raw PCM to browser as binary WebSocket message
-    if (this.ws && this.ws.readyState === 1) { // WebSocket.OPEN
+    if (this.ws && this.ws.readyState === 1) {
       try {
         this.ws.send(pcmBuffer, { binary: true });
+        this._diag.pcmOut++;
       } catch (err) {
-        // WebSocket might have closed
+        this._diag.wsErr++;
+        console.error(`[Voice][DIAG] WS send error for ${this.username}:`, err.message);
       }
     }
   }
@@ -366,6 +398,7 @@ class VoiceSession {
    */
   sendAudioToMumble(pcmData) {
     if (!this.ready || !this.socket) return;
+    this._diag.pcmIn++;
 
     const samplesPerFrame = this.bridge.samplesPerFrame;
     // Copy to aligned buffer — Node.js Buffers can have odd byteOffset
@@ -386,9 +419,11 @@ class VoiceSession {
         if (opusFrame && opusFrame.length > 0) {
           const isLast = (offset + samplesPerFrame * 2 > int16.length);
           this._sendOpusToMumble(opusFrame, isLast);
+          this._diag.opusOut++;
         }
       } catch (err) {
-        // Occasional encode errors during voice transitions
+        this._diag.encErr++;
+        console.error(`[Voice][DIAG] Encode error for ${this.username}:`, err.message);
       }
     }
   }
@@ -504,6 +539,16 @@ class VoiceSession {
   }
 
   /**
+   * Move this session's Mumble user to a specific channel.
+   */
+  moveToChannel(channelId) {
+    if (this.ready && this.mumbleSession !== null) {
+      this._sendProto('UserState', { session: this.mumbleSession, channelId });
+      console.log(`[Voice] Moving ${this.username} to channel ${channelId}`);
+    }
+  }
+
+  /**
    * Send a protobuf message to this session's Mumble connection.
    */
   _sendProto(typeName, data) {
@@ -544,6 +589,10 @@ class VoiceSession {
   disconnect() {
     this.ready = false;
     this._stopPing();
+    if (this._diagInterval) {
+      clearInterval(this._diagInterval);
+      this._diagInterval = null;
+    }
     if (this._decoderCleanupInterval) {
       clearInterval(this._decoderCleanupInterval);
       this._decoderCleanupInterval = null;

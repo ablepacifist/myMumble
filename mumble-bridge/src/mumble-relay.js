@@ -18,13 +18,15 @@ function setupMumbleListeners(mumble, state, broadcastAll, broadcastToChannel) {
   });
 
   mumble.on('ChannelState', (msg) => {
-    state.channels.set(msg.channelId, {
+    const existing = state.channels.get(msg.channelId);
+    const ch = {
       id: msg.channelId,
-      name: msg.name || state.channels.get(msg.channelId)?.name || '',
-      parent: msg.parent,
+      name: msg.name || (existing ? existing.name : ''),
+      parentId: msg.parent !== undefined ? msg.parent : (existing ? existing.parentId : 0),
       description: msg.description || '',
-    });
-    broadcastAll({ type: 'channel_update', channel: state.channels.get(msg.channelId) });
+    };
+    state.channels.set(msg.channelId, ch);
+    broadcastAll({ type: 'channel_update', channel: ch });
   });
 
   mumble.on('ChannelRemove', (msg) => {

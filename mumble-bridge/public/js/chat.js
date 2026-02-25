@@ -1,5 +1,5 @@
 /**
- * IDIOTS PLAY GAMES — Voice Chat Client
+ * IDIOTS PLAY GAMES — Voice Chat Client (Discord-style)
  * Connects to the Mumble Bridge via WebSocket.
  */
 (function () {
@@ -9,46 +9,92 @@
   let ws = null;
   let username = '';
   let userId = null;
-  let currentChannelId = 0;
-  let channels = new Map();
-  let users = new Map();
-  let webClients = new Map(); // web_userId -> { id, username, channelId, inVoice }
+  let isAdmin = false;
+  let currentChannelId = 1;  // default to 'general' channel
+  let channels = new Map();       // id -> { id, name, parentId, ... }
+  let users = new Map();          // session -> mumble user
+  let webClients = new Map();     // web_userId -> { id, username, channelId, inVoice }
   let reconnectTimer = null;
   let reconnectAttempts = 0;
   const MAX_RECONNECT = 10;
   let pollTimer = null;
-  const POLL_INTERVAL = 5000; // refresh messages every 5 seconds
-  const seenMessageIds = new Set(); // dedup messages by id
-  const ACTIVITY_CHANNEL_ID = '__activity__'; // Virtual channel for activity feed
-  let activityMessages = []; // Stored activity messages for the virtual channel
-  const speakingUsers = new Set(); // webClientIds currently speaking
-  const speakingTimers = new Map(); // debounce timers for speaking indicators
+  const POLL_INTERVAL = 30000;
+  const seenMessageIds = new Set();
+  const ACTIVITY_CHANNEL_ID = '__activity__';
+  let activityMessages = [];
+  let collapsedCategories = new Set(); // persisted category collapsed state
+  let memberListVisible = true;
+  let lastMessageAuthor = null;     // for grouping messages
+  let lastMessageTime = 0;
+
+  // Avatar cache
+  const avatarCache = {};
+  const DEFAULT_AVATAR = '/uploads/avatars/default.jpg';
+
+  // Voice settings (persisted to localStorage)
+  let voiceSettings = loadVoiceSettings();
 
   // ── DOM refs ─────────────────────────────────────────────
   const $ = (sel) => document.querySelector(sel);
-  const loginScreen   = $('#login-screen');
-  const chatScreen    = $('#chat-screen');
-  const usernameInput = $('#username-input');
-  const loginBtn      = $('#login-btn');
-  const loginError    = $('#login-error');
-  const sidebar       = $('#sidebar');
-  const toggleSidebar = $('#toggle-sidebar-btn');
-  const channelList   = $('#channel-list');
-  const userList      = $('#user-list');
-  const userCount     = $('#user-count');
-  const myUsername    = $('#my-username');
-  const disconnectBtn = $('#disconnect-btn');
-  const channelHeader = $('#current-channel-name');
-  const messagesEl    = $('#messages');
-  const msgContainer  = $('#messages-container');
-  const messageInput  = $('#message-input');
-  const sendBtn       = $('#send-btn');
-  const statusDot     = $('#connection-status');
-  const addChannelBtn  = $('#add-channel-btn');
-  const channelDialog  = $('#channel-dialog');
+  const loginScreen     = $('#login-screen');
+  const chatScreen      = $('#chat-screen');
+  const usernameInput   = $('#username-input');
+  const loginBtn        = $('#login-btn');
+  const loginError      = $('#login-error');
+  const sidebar         = $('#sidebar');
+  const toggleSidebar   = $('#toggle-sidebar-btn');
+  const channelTree     = $('#channel-tree');
+  const myUsername       = $('#my-username');
+  const myAvatar        = $('#my-avatar');
+  const channelHeader   = $('#current-channel-name');
+  const channelHash     = $('.channel-hash');
+  const messagesEl      = $('#messages');
+  const msgContainer    = $('#messages-container');
+  const messageInput    = $('#message-input');
+  const sendBtn         = $('#send-btn');
+  const statusDot       = $('#connection-status');
+  const channelDialog   = $('#channel-dialog');
   const channelNameInput = $('#channel-name-input');
-  const channelSaveBtn = $('#channel-save-btn');
+  const channelCategorySelect = $('#channel-category-select');
+  const channelVoiceCheck = $('#channel-voice-check');
+  const channelSaveBtn  = $('#channel-save-btn');
   const channelCancelBtn = $('#channel-cancel-btn');
+  const membersToggle   = $('#members-toggle');
+  const memberList      = $('#member-list');
+  const memberListContent = $('#member-list-content');
+  const settingsBtn     = $('#settings-btn');
+  const settingsModal   = $('#settings-modal');
+  const settingsClose   = $('#settings-close');
+  const settingsLogout  = $('#settings-logout');
+  const muteBtn         = $('#mute-btn');
+  const deafenBtn       = $('#deafen-btn');
+  const headerVoiceBtn  = $('#header-voice-btn');
+
+  // Settings DOM
+  const profileAvatar   = $('#profile-avatar-preview');
+  const avatarUpload    = $('#avatar-upload');
+  const avatarRemove    = $('#avatar-remove');
+  const profileDisplayName = $('#profile-display-name');
+  const profileUsername  = $('#profile-username');
+
+  // Voice settings DOM
+  const voiceInputDevice = $('#voice-input-device');
+  const voiceOutputDevice = $('#voice-output-device');
+  const voiceInputVolume = $('#voice-input-volume');
+  const voiceOutputVolume = $('#voice-output-volume');
+  const voiceVadThreshold = $('#voice-vad-threshold');
+  const voiceEchoCancel = $('#voice-echo-cancel');
+  const voiceNoiseSuppress = $('#voice-noise-suppress');
+  const voiceAutoGain   = $('#voice-auto-gain');
+  const voiceInputVolumeVal = $('#voice-input-volume-val');
+  const voiceOutputVolumeVal = $('#voice-output-volume-val');
+  const voiceVadThresholdVal = $('#voice-vad-threshold-val');
+  const voiceTestBtn    = $('#voice-test-btn');
+  const voiceTestMeter  = $('#voice-test-meter');
+
+  // Appearance
+  const appearanceFontSize = $('#appearance-font-size');
+  const appearanceCompact = $('#appearance-compact');
 
   // ── Helpers ──────────────────────────────────────────────
   function setStatus(state) {
@@ -71,6 +117,9 @@
     messageInput.disabled = false;
     sendBtn.disabled = false;
     messageInput.focus();
+    myUsername.textContent = username;
+    profileUsername.value = username;
+    profileDisplayName.value = username;
   }
 
   function switchToLogin() {
@@ -79,10 +128,13 @@
     messageInput.disabled = true;
     sendBtn.disabled = true;
     messagesEl.innerHTML = '';
-    channelList.innerHTML = '';
-    userList.innerHTML = '';
+    channelTree.innerHTML = '';
+    memberListContent.innerHTML = '';
     channels.clear();
     users.clear();
+    webClients.clear();
+    lastMessageAuthor = null;
+    lastMessageTime = 0;
   }
 
   function scrollToBottom() {
@@ -93,7 +145,13 @@
 
   function formatTime(iso) {
     const d = new Date(iso);
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const now = new Date();
+    const isToday = d.toDateString() === now.toDateString();
+    const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    if (isToday) return 'Today at ' + time;
+    const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
+    if (d.toDateString() === yesterday.toDateString()) return 'Yesterday at ' + time;
+    return d.toLocaleDateString([], { month: '2-digit', day: '2-digit', year: 'numeric' }) + ' ' + time;
   }
 
   function escapeHtml(str) {
@@ -106,6 +164,31 @@
     return str.replace(/<[^>]+>/g, '').trim();
   }
 
+  function getAvatarUrl(username) {
+    return avatarCache[username] || DEFAULT_AVATAR;
+  }
+
+  // ── Voice Settings Persistence ───────────────────────────
+  function loadVoiceSettings() {
+    try {
+      const s = JSON.parse(localStorage.getItem('voiceSettings'));
+      return Object.assign({
+        inputDeviceId: 'default',
+        outputDeviceId: 'default',
+        inputVolume: 100,
+        outputVolume: 100,
+        vadThreshold: 200,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      }, s || {});
+    } catch { return { inputDeviceId: 'default', outputDeviceId: 'default', inputVolume: 100, outputVolume: 100, vadThreshold: 200, echoCancellation: true, noiseSuppression: true, autoGainControl: true }; }
+  }
+
+  function saveVoiceSettings() {
+    localStorage.setItem('voiceSettings', JSON.stringify(voiceSettings));
+  }
+
   // ── WebSocket URL ────────────────────────────────────────
   function getWsUrl() {
     const loc = window.location;
@@ -116,50 +199,36 @@
   // ── Connection ───────────────────────────────────────────
   function connect() {
     if (ws && ws.readyState <= 1) return;
-
     setStatus('connecting');
-    const url = getWsUrl();
-    ws = new WebSocket(url);
-    ws.binaryType = 'arraybuffer'; // Receive binary audio as ArrayBuffer
+    ws = new WebSocket(getWsUrl());
+    ws.binaryType = 'arraybuffer';
 
     ws.onopen = () => {
-      console.log('[WS] Connected');
       setStatus('connected');
       reconnectAttempts = 0;
-
-      // Authenticate
       ws.send(JSON.stringify({ type: 'auth', username }));
     };
 
     ws.onmessage = (ev) => {
-      // Binary messages = audio from Mumble
       if (ev.data instanceof ArrayBuffer) {
         handleAudioFromServer(ev.data);
         return;
       }
-      try {
-        const msg = JSON.parse(ev.data);
-        handleMessage(msg);
-      } catch (e) {
-        console.error('[WS] Bad message:', e);
-      }
+      try { handleMessage(JSON.parse(ev.data)); }
+      catch (e) { console.error('[WS] Bad message:', e); }
     };
 
     ws.onclose = () => {
-      console.log('[WS] Disconnected');
       setStatus('disconnected');
       scheduleReconnect();
     };
-
-    ws.onerror = (err) => {
-      console.error('[WS] Error:', err);
-    };
+    ws.onerror = (err) => console.error('[WS] Error:', err);
   }
 
   function disconnect() {
     clearTimeout(reconnectTimer);
     stopPolling();
-    reconnectAttempts = MAX_RECONNECT; // prevent reconnect
+    reconnectAttempts = MAX_RECONNECT;
     if (ws) ws.close();
     ws = null;
     username = '';
@@ -180,19 +249,19 @@
   }
 
   function stopPolling() {
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   }
 
   function scheduleReconnect() {
     if (reconnectAttempts >= MAX_RECONNECT) return;
     reconnectAttempts++;
     const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 30000);
-    console.log(`[WS] Reconnecting in ${delay / 1000}s (attempt ${reconnectAttempts})`);
-    addSystemMessage(`Connection lost. Reconnecting in ${Math.round(delay / 1000)}s...`);
+    addActivityMessage(`Connection lost. Reconnecting in ${Math.round(delay / 1000)}s...`);
     reconnectTimer = setTimeout(() => connect(), delay);
+  }
+
+  function send(obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
   }
 
   // ── Message Handler ──────────────────────────────────────
@@ -201,34 +270,28 @@
       case 'auth_ok':
         userId = msg.userId;
         username = msg.username;
+        isAdmin = !!msg.isAdmin;
         myUsername.textContent = username;
+        profileUsername.value = username;
+        profileDisplayName.value = username;
         switchToChat();
-        addSystemMessage(`Connected as ${username}`);
-        // Request history
+        addActivityMessage(`Connected as ${username}`);
         send({ type: 'get_history', channelId: currentChannelId, limit: 50 });
-        // Join default channel
         send({ type: 'join_channel', channelId: currentChannelId });
-        // Start polling for new messages
         startPolling();
+        // Load our avatar
+        loadMyAvatar();
         break;
 
       case 'server_state':
-        // Initial state — channels + users
-        if (msg.channels) {
-          msg.channels.forEach(ch => channels.set(ch.id, ch));
-        }
-        if (msg.users) {
-          msg.users.forEach(u => users.set(u.session, u));
-        }
+        if (msg.channels) msg.channels.forEach(ch => channels.set(ch.id, ch));
+        if (msg.users) msg.users.forEach(u => users.set(u.session, u));
         renderChannels();
-        renderUsers();
+        renderMembers();
         break;
 
       case 'channel_update':
-        if (msg.channel) {
-          channels.set(msg.channel.id, msg.channel);
-          renderChannels();
-        }
+        if (msg.channel) { channels.set(msg.channel.id, msg.channel); renderChannels(); }
         break;
 
       case 'channel_remove':
@@ -239,56 +302,49 @@
       case 'user_update':
         if (msg.user) {
           users.set(msg.user.session, msg.user);
-          renderUsers();
-          // If this is a new user joining, show system message
-          const existingNames = new Set();
-          users.forEach(u => existingNames.add(u.name));
-          if (msg.user.name && !existingNames.has(msg.user.name)) {
-            addActivityMessage(`${msg.user.name} joined`);
-          }
+          renderMembers();
         }
         break;
 
       case 'user_remove':
         users.delete(msg.session);
-        renderUsers();
-        if (msg.name) {
-          addActivityMessage(`${msg.name} left`);
-        }
+        renderMembers();
+        if (msg.name) addActivityMessage(`${msg.name} left`);
         break;
 
       case 'web_users':
-        // Full list of web clients (sent on connect)
         webClients.clear();
-        if (msg.webClients) {
-          msg.webClients.forEach(wc => webClients.set(wc.id, wc));
-        }
-        renderUsers();
+        if (msg.webClients) msg.webClients.forEach(wc => {
+          webClients.set(wc.id, wc);
+          if (wc.avatarUrl) avatarCache[wc.username] = wc.avatarUrl + '?t=' + Date.now();
+        });
+        renderMembers();
+        renderChannels();
         break;
 
       case 'web_user_join':
         if (msg.webClient) {
           webClients.set(msg.webClient.id, msg.webClient);
-          renderUsers();
-          // Don't show join message for ourselves
-          if (msg.webClient.id !== `web_${userId}`) {
-            addActivityMessage(`${msg.webClient.username} joined`);
-          }
+          if (msg.webClient.avatarUrl) avatarCache[msg.webClient.username] = msg.webClient.avatarUrl + '?t=' + Date.now();
+          renderMembers();
+          renderChannels();
+          if (msg.webClient.id !== `web_${userId}`) addActivityMessage(`${msg.webClient.username} joined`);
         }
         break;
 
       case 'web_user_leave':
         webClients.delete(msg.id);
-        renderUsers();
-        if (msg.username) {
-          addActivityMessage(`${msg.username} left`);
-        }
+        renderMembers();
+        if (msg.username) addActivityMessage(`${msg.username} left`);
         break;
 
       case 'voice_state':
         if (msg.id && webClients.has(msg.id)) {
-          webClients.get(msg.id).inVoice = msg.inVoice;
-          renderUsers();
+          const wc = webClients.get(msg.id);
+          wc.inVoice = msg.inVoice;
+          wc.voiceChannelId = msg.voiceChannelId || null;
+          renderMembers();
+          renderChannels();
           if (msg.id !== `web_${userId}`) {
             addActivityMessage(msg.inVoice ? `🎤 ${msg.username} joined voice` : `${msg.username} left voice`);
           }
@@ -296,25 +352,11 @@
         break;
 
       case 'voice_ready':
-        // Server confirmed our Mumble voice session is active
         console.log('[Voice] Server confirmed voice session ready');
         break;
 
       case 'voice_stopped':
-        // Server confirmed voice session stopped
         console.log('[Voice] Server confirmed voice session stopped');
-        break;
-
-      case 'voice_speaking':
-        // Speaking indicator from server
-        if (msg.id) {
-          if (msg.speaking) {
-            speakingUsers.add(msg.id);
-          } else {
-            speakingUsers.delete(msg.id);
-          }
-          renderUsers();
-        }
         break;
 
       case 'text':
@@ -323,7 +365,6 @@
 
       case 'history': {
         if (msg.messages && msg.messages.length > 0) {
-          // Deduplicate using normalized key (same as addChatMessage)
           const newMsgs = msg.messages.filter(m => {
             const name = m.senderName || m.username || '';
             const text = m.content || m.text || '';
@@ -340,7 +381,6 @@
               const tA = new Date(a.createdAt || a.sentAt || a.timestamp || 0).getTime();
               const tB = new Date(b.createdAt || b.sentAt || b.timestamp || 0).getTime();
               if (tA !== tB) return tA - tB;
-              // If same timestamp, sort by id if available
               return (a.id || 0) - (b.id || 0);
             })
             .forEach(m => {
@@ -352,55 +392,49 @@
               }, true);
             });
         }
-        // Only auto-scroll on initial load, never on poll refreshes
-        if (!msg._isRefresh) {
-          scrollToBottom();
-        }
+        if (!msg._isRefresh) scrollToBottom();
         break;
       }
 
       case 'joined_channel':
         currentChannelId = msg.channelId;
-        const ch = channels.get(currentChannelId);
-        channelHeader.textContent = '#' + (ch ? ch.name : 'Unknown');
+        updateChannelHeader();
         renderChannels();
         break;
 
       case 'error':
-        if (!userId) {
-          showError(msg.message);
-        } else {
-          addSystemMessage('Error: ' + msg.message);
-        }
+        if (!userId) showError(msg.message);
+        else addSystemMessage('Error: ' + msg.message);
         break;
 
       case 'media_results':
         if (msg.results && msg.results.length > 0) {
           addSystemMessage(`Found ${msg.results.length} results:`);
-          msg.results.slice(0, 5).forEach((r, i) => {
-            addSystemMessage(`  ${i + 1}. ${r.title || r.name || 'Untitled'}`);
-          });
-        } else {
-          addSystemMessage('No media results found.');
-        }
+          msg.results.slice(0, 5).forEach((r, i) => addSystemMessage(`  ${i + 1}. ${r.title || r.name || 'Untitled'}`));
+        } else addSystemMessage('No media results found.');
         break;
 
       case 'now_playing':
-        if (msg.state && msg.state.title) {
-          addSystemMessage(`🎵 Now playing: ${msg.state.title}`);
-        } else {
-          addSystemMessage('🎵 Nothing playing right now.');
-        }
+        if (msg.state && msg.state.title) addSystemMessage(`🎵 Now playing: ${msg.state.title}`);
+        else addSystemMessage('🎵 Nothing playing right now.');
         break;
 
       case 'music_queue':
         if (msg.queue && msg.queue.length > 0) {
           addSystemMessage(`Queue (${msg.queue.length} tracks):`);
-          msg.queue.slice(0, 5).forEach((t, i) => {
-            addSystemMessage(`  ${i + 1}. ${t.title || 'Untitled'}`);
-          });
-        } else {
-          addSystemMessage('Queue is empty.');
+          msg.queue.slice(0, 5).forEach((t, i) => addSystemMessage(`  ${i + 1}. ${t.title || 'Untitled'}`));
+        } else addSystemMessage('Queue is empty.');
+        break;
+
+      case 'avatar_updated':
+        if (msg.avatarUrl) {
+          avatarCache[msg.username || username] = msg.avatarUrl + '?t=' + Date.now();
+          if (!msg.username || msg.username === username) {
+            myAvatar.src = avatarCache[username];
+            profileAvatar.src = avatarCache[username];
+          }
+          renderMembers();
+          renderChannels();
         }
         break;
 
@@ -409,275 +443,354 @@
     }
   }
 
-  function send(obj) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(obj));
+  // ── Channel Header ───────────────────────────────────────
+  function updateChannelHeader() {
+    if (currentChannelId === ACTIVITY_CHANNEL_ID) {
+      channelHeader.textContent = 'Activity';
+      channelHash.textContent = '📋';
+      messageInput.placeholder = 'Activity feed is read-only';
+    } else {
+      const ch = channels.get(currentChannelId);
+      const name = ch ? ch.name : 'general';
+      channelHeader.textContent = name;
+      channelHash.textContent = '#';
+      messageInput.placeholder = `Message #${name}`;
     }
   }
 
-  // ── Rendering ────────────────────────────────────────────
+  // ── Rendering: Channel Tree ──────────────────────────────
   function renderChannels() {
-    channelList.innerHTML = '';
-    const sorted = Array.from(channels.values()).sort((a, b) => a.id - b.id);
-    sorted.forEach(ch => {
-      const li = document.createElement('li');
-      li.textContent = ch.name || 'Unnamed';
-      if (ch.id === currentChannelId) li.classList.add('active');
-      li.addEventListener('click', () => joinChannel(ch.id));
-      channelList.appendChild(li);
+    channelTree.innerHTML = '';
+
+    // Build parent->children map
+    const allChannels = Array.from(channels.values());
+    const rootChannels = []; // parentId === 0 or undefined
+    const categoryChannels = new Map(); // parentId -> children[]
+
+    allChannels.forEach(ch => {
+      if (ch.id === 0) return; // Skip Root
+      const pid = ch.parentId || 0;
+      if (pid === 0) {
+        rootChannels.push(ch);
+      } else {
+        if (!categoryChannels.has(pid)) categoryChannels.set(pid, []);
+        categoryChannels.get(pid).push(ch);
+      }
     });
 
-    // Activity virtual channel (always at the bottom)
-    const actLi = document.createElement('li');
-    actLi.className = 'activity-channel';
-    actLi.textContent = '📋 Activity';
-    if (currentChannelId === ACTIVITY_CHANNEL_ID) actLi.classList.add('active');
-    actLi.addEventListener('click', () => joinChannel(ACTIVITY_CHANNEL_ID));
-    channelList.appendChild(actLi);
+    // Separate categories (channels that have children) from leaf channels
+    const categories = rootChannels.filter(ch => categoryChannels.has(ch.id));
+    const standaloneChannels = rootChannels.filter(ch => !categoryChannels.has(ch.id));
+
+    // Render standalone channels first (under no category)
+    if (standaloneChannels.length > 0) {
+      standaloneChannels.sort((a, b) => a.id - b.id).forEach(ch => {
+        channelTree.appendChild(createChannelItem(ch));
+      });
+    }
+
+    // Render each category
+    categories.sort((a, b) => a.id - b.id).forEach(cat => {
+      const isCollapsed = collapsedCategories.has(cat.id);
+
+      // Category header
+      const header = document.createElement('div');
+      header.className = 'category-header' + (isCollapsed ? ' collapsed' : '');
+      header.innerHTML = `
+        <svg class="category-arrow" viewBox="0 0 24 24" fill="currentColor"><path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z"/></svg>
+        <span class="category-label">${escapeHtml(cat.name)}</span>
+        ${isAdmin ? `<div class="category-actions">
+          <button class="category-action-btn" title="Create Channel">+</button>
+        </div>` : ''}
+      `;
+      header.addEventListener('click', (e) => {
+        if (e.target.closest('.category-action-btn')) {
+          e.stopPropagation();
+          openChannelDialog(cat.id);
+          return;
+        }
+        if (isCollapsed) collapsedCategories.delete(cat.id);
+        else collapsedCategories.add(cat.id);
+        renderChannels();
+      });
+      channelTree.appendChild(header);
+
+      // Children container
+      const childContainer = document.createElement('div');
+      childContainer.className = 'category-channels';
+      if (!isCollapsed) {
+        const children = (categoryChannels.get(cat.id) || []).sort((a, b) => a.id - b.id);
+        children.forEach(ch => {
+          childContainer.appendChild(createChannelItem(ch));
+        });
+      }
+      channelTree.appendChild(childContainer);
+    });
+
+    // Activity virtual channel at end
+    const actItem = document.createElement('div');
+    actItem.className = 'channel-item activity-channel' + (currentChannelId === ACTIVITY_CHANNEL_ID ? ' active' : '');
+    actItem.innerHTML = `<span class="channel-icon">📋</span><span class="channel-name">Activity</span>`;
+    actItem.addEventListener('click', () => joinChannel(ACTIVITY_CHANNEL_ID));
+    channelTree.appendChild(actItem);
+
+    // Update category select in dialog
+    channelCategorySelect.innerHTML = '<option value="0">No Category (Root)</option>';
+    categories.forEach(cat => {
+      const opt = document.createElement('option');
+      opt.value = cat.id;
+      opt.textContent = cat.name;
+      channelCategorySelect.appendChild(opt);
+    });
   }
 
-  function renderUsers() {
-    userList.innerHTML = '';
+  function createChannelItem(ch) {
+    // Detect voice channels: under a parent named "Voice Channels", or name contains voice/walky/afk
+    const parentCh = channels.get(ch.parentId);
+    const isUnderVoiceCategory = parentCh && parentCh.name && parentCh.name.toLowerCase().includes('voice');
+    const isVoice = isUnderVoiceCategory || (ch.name && (ch.name.toLowerCase().includes('voice') || ch.name.toLowerCase().includes('walky')));
+    const icon = isVoice ? '🔊' : '#';
+    const item = document.createElement('div');
+    item.className = 'channel-item' + (ch.id === currentChannelId && !isVoice ? ' active' : '') + (isVoice ? ' voice-channel' : '');
 
-    // Collect web clients (real users)
+    // Check if current user is in this voice channel
+    const myWc = webClients.get(`web_${userId}`);
+    const isMyVoiceChannel = isVoice && myWc && myWc.inVoice && myWc.voiceChannelId === ch.id;
+    if (isMyVoiceChannel) item.classList.add('active');
+
+    item.innerHTML = `
+      <span class="channel-icon">${icon}</span>
+      <span class="channel-name">${escapeHtml(ch.name || 'Unnamed')}</span>
+      ${isAdmin ? `<div class="channel-actions">
+        <button class="channel-action-btn" title="Delete channel">&times;</button>
+      </div>` : ''}
+    `;
+    item.addEventListener('click', (e) => {
+      if (e.target.closest('.channel-action-btn')) {
+        e.stopPropagation();
+        if (confirm(`Delete #${ch.name}?`)) {
+          send({ type: 'remove_channel', channelId: ch.id });
+        }
+        return;
+      }
+      if (isVoice) {
+        joinVoiceChannel(ch.id);
+      } else {
+        joinChannel(ch.id);
+      }
+    });
+
+    // Show voice users under voice channels (matched by voiceChannelId)
+    if (isVoice) {
+      const voiceUsers = Array.from(webClients.values()).filter(wc => wc.inVoice && wc.voiceChannelId === ch.id);
+      const container = document.createElement('div');
+      container.appendChild(item);
+      if (voiceUsers.length > 0) {
+        const userList = document.createElement('div');
+        userList.className = 'voice-channel-users';
+        voiceUsers.forEach(wc => {
+          const vu = document.createElement('div');
+          vu.className = 'voice-user';
+          vu.innerHTML = `<img class="avatar" src="${getAvatarUrl(wc.username)}" alt=""><span>${escapeHtml(wc.username)}</span>`;
+          userList.appendChild(vu);
+        });
+        container.appendChild(userList);
+      }
+      return container;
+    }
+    return item;
+  }
+
+  function openChannelDialog(parentId) {
+    channelDialog.classList.remove('hidden');
+    channelNameInput.value = '';
+    channelNameInput.focus();
+    if (parentId !== undefined) channelCategorySelect.value = String(parentId);
+  }
+
+  // ── Rendering: Member List (right panel) ─────────────────
+  function renderMembers() {
+    memberListContent.innerHTML = '';
+
     const webUsers = Array.from(webClients.values()).sort((a, b) => (a.username || '').localeCompare(b.username || ''));
-
-    // Collect Mumble-native users (exclude the bridge bot)
     const mumbleUsers = Array.from(users.values())
       .filter(u => u.name && u.name !== 'MumbleBridge')
       .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
 
-    // Voice members section
+    // Voice users
     const voiceMembers = webUsers.filter(wc => wc.inVoice);
     if (voiceMembers.length > 0) {
-      const voiceHeader = document.createElement('li');
-      voiceHeader.className = 'user-section-header';
-      voiceHeader.textContent = `🔊 In Voice — ${voiceMembers.length}`;
-      userList.appendChild(voiceHeader);
+      addMemberCategory(`In Voice — ${voiceMembers.length}`);
       voiceMembers.forEach(wc => {
-        const li = document.createElement('li');
-        li.className = 'user-item in-voice';
-        if (speakingUsers.has(wc.id)) li.classList.add('speaking');
-        const dot = document.createElement('span');
-        dot.className = 'user-avatar voice';
-        li.appendChild(dot);
-        const name = document.createElement('span');
-        name.textContent = wc.username + ' 🎤';
-        li.appendChild(name);
-        userList.appendChild(li);
+        addMemberItem(wc.username, true, false, '🎤 Connected');
       });
     }
 
-    // Online web users section
-    const onlineHeader = document.createElement('li');
-    onlineHeader.className = 'user-section-header';
-    onlineHeader.textContent = `Online — ${webUsers.length}`;
-    userList.appendChild(onlineHeader);
-    webUsers.forEach(wc => {
-      const li = document.createElement('li');
-      li.className = 'user-item';
-      if (wc.inVoice) li.classList.add('in-voice');
-      const dot = document.createElement('span');
-      dot.className = 'user-avatar' + (wc.inVoice ? ' voice' : '');
-      li.appendChild(dot);
-      const name = document.createElement('span');
-      name.textContent = wc.username + (wc.inVoice ? ' 🎤' : '');
-      li.appendChild(name);
-      userList.appendChild(li);
-    });
+    // Online
+    const onlineNotVoice = webUsers.filter(wc => !wc.inVoice);
+    addMemberCategory(`Online — ${webUsers.length}`);
+    onlineNotVoice.forEach(wc => addMemberItem(wc.username, true, false, 'Online'));
 
-    // Mumble-native users section (if any besides the bot)
+    // Mumble native
     if (mumbleUsers.length > 0) {
-      const mumbleHeader = document.createElement('li');
-      mumbleHeader.className = 'user-section-header';
-      mumbleHeader.textContent = `Mumble — ${mumbleUsers.length}`;
-      userList.appendChild(mumbleHeader);
+      addMemberCategory(`Mumble — ${mumbleUsers.length}`);
       mumbleUsers.forEach(u => {
-        const li = document.createElement('li');
-        li.className = 'user-item';
-        const dot = document.createElement('span');
-        dot.className = 'user-avatar';
-        li.appendChild(dot);
-        const name = document.createElement('span');
-        name.textContent = u.name;
-        li.appendChild(name);
-        const chTag = document.createElement('span');
-        chTag.className = 'user-channel';
-        const userCh = channels.get(u.channelId);
-        chTag.textContent = userCh ? userCh.name : '';
-        li.appendChild(chTag);
-        userList.appendChild(li);
+        const ch = channels.get(u.channelId);
+        addMemberItem(u.name, true, false, ch ? ch.name : '');
       });
     }
-
-    userCount.textContent = webUsers.length + mumbleUsers.length;
   }
+
+  function addMemberCategory(text) {
+    const div = document.createElement('div');
+    div.className = 'member-category';
+    div.textContent = text;
+    memberListContent.appendChild(div);
+  }
+
+  function addMemberItem(name, online, speaking, status) {
+    const div = document.createElement('div');
+    div.className = 'member-item' + (online ? ' online' : '') + (speaking ? ' speaking' : '');
+    div.innerHTML = `
+      <img class="avatar avatar-sm" src="${getAvatarUrl(name)}" alt="">
+      <div class="member-item-info">
+        <div class="member-item-name">${escapeHtml(name)}</div>
+        ${status ? `<div class="member-item-status">${escapeHtml(status)}</div>` : ''}
+      </div>
+    `;
+    memberListContent.appendChild(div);
+  }
+
+  // ── Join Channel ─────────────────────────────────────────
+  let currentVoiceChannelId = null;
 
   function joinChannel(chId) {
     currentChannelId = chId;
+    lastMessageAuthor = null;
+    lastMessageTime = 0;
 
     if (chId === ACTIVITY_CHANNEL_ID) {
-      // Virtual activity channel — show stored activity messages
-      channelHeader.textContent = '📋 Activity';
+      updateChannelHeader();
       renderChannels();
       messagesEl.innerHTML = '';
       seenMessageIds.clear();
-
-      // Render stored activity messages
-      activityMessages.forEach(am => {
-        const div = document.createElement('div');
-        div.className = 'message system-msg';
-        const header = document.createElement('div');
-        header.className = 'msg-header';
-        const time = document.createElement('span');
-        time.className = 'msg-time';
-        time.textContent = formatTime(am.timestamp);
-        header.appendChild(time);
-        const text = document.createElement('div');
-        text.className = 'msg-text';
-        text.textContent = am.text;
-        div.appendChild(header);
-        div.appendChild(text);
-        messagesEl.appendChild(div);
-      });
+      activityMessages.forEach(am => addSystemMessage(am.text, am.timestamp));
       scrollToBottom();
-
-      // Stop polling (activity channel doesn't use server history)
       stopPolling();
-      // Hide input bar (read-only channel)
       messageInput.disabled = true;
       sendBtn.disabled = true;
-      messageInput.placeholder = 'Activity feed is read-only';
       sidebar.classList.remove('open');
       return;
     }
 
-    // Normal channel
     messageInput.disabled = false;
     sendBtn.disabled = false;
-    messageInput.placeholder = 'Type a message...';
-
     send({ type: 'join_channel', channelId: chId });
-    const ch = channels.get(chId);
-    channelHeader.textContent = '#' + (ch ? ch.name : 'Unknown');
+    updateChannelHeader();
     renderChannels();
-
-    // Clear messages and load history for new channel
     messagesEl.innerHTML = '';
     seenMessageIds.clear();
     send({ type: 'get_history', channelId: chId, limit: 50 });
-
-    // Restart polling for the new channel
     startPolling();
-
-    // Close mobile sidebar
     sidebar.classList.remove('open');
   }
 
-  // ── Chat Messages ────────────────────────────────────────
+  function joinVoiceChannel(chId) {
+    if (voiceActive && currentVoiceChannelId === chId) {
+      // Already in this voice channel — disconnect
+      stopVoice();
+      return;
+    }
+    currentVoiceChannelId = chId;
+    if (voiceActive) {
+      // Move to different voice channel
+      send({ type: 'voice_join_channel', channelId: chId });
+      addActivityMessage(`🔊 Moved to ${channels.get(chId)?.name || 'voice channel'}`);
+      renderChannels();
+    } else {
+      // Start voice in this channel
+      startVoice(chId);
+    }
+  }
 
-  /** Normalize dedup key: username + clean text (timestamps differ between sources) */
+  // ── Chat Messages (Discord-style grouping) ───────────────
   function dedupKey(name, text) {
     return (name || '').toLowerCase() + '|' + stripHtml(text || '').toLowerCase().trim();
   }
 
   function addChatMessage(msg, isHistory) {
-    // Dedup real-time messages too
     const key = msg.id ? String(msg.id) : dedupKey(msg.username, msg.text);
-    if (seenMessageIds.has(key)) return;
-    seenMessageIds.add(key);
 
-    const div = document.createElement('div');
-    div.className = 'message';
-
-    const header = document.createElement('div');
-    header.className = 'msg-header';
-
-    const author = document.createElement('span');
-    author.className = 'msg-author';
-    const displayName = msg.username || 'Unknown';
-    author.textContent = displayName;
-
-    // Color the author name
-    if (displayName === username) {
-      author.classList.add('self');
-    } else if (msg.source === 'mumble') {
-      author.classList.add('mumble');
+    if (msg.source === 'self') {
+      // Self-sent messages always display — the user explicitly typed them.
+      // Register the text fingerprint so history polling won't re-add the same message.
+      seenMessageIds.add(key);
+    } else {
+      if (seenMessageIds.has(key)) return;
+      seenMessageIds.add(key);
     }
 
-    const time = document.createElement('span');
-    time.className = 'msg-time';
-    time.textContent = formatTime(msg.timestamp || new Date().toISOString());
-
-    header.appendChild(author);
-    header.appendChild(time);
-
-    const text = document.createElement('div');
-    text.className = 'msg-text';
-    // Strip HTML tags from Mumble messages but keep the text
+    const author = msg.username || 'Unknown';
+    const time = msg.timestamp || new Date().toISOString();
+    const timeMs = new Date(time).getTime();
     const cleanText = stripHtml(msg.text || '');
-    text.textContent = cleanText;
 
-    div.appendChild(header);
-    div.appendChild(text);
+    // Group: same author within 7 minutes = compact message
+    const showHeader = (author !== lastMessageAuthor || (timeMs - lastMessageTime) > 7 * 60 * 1000);
+
+    const div = document.createElement('div');
+    div.className = 'message' + (showHeader ? ' has-header' : '');
+
+    if (showHeader) {
+      div.innerHTML = `
+        <div class="message-avatar"><img class="avatar avatar-md" src="${getAvatarUrl(author)}" alt=""></div>
+        <div class="message-body">
+          <div class="message-header">
+            <span class="message-author">${escapeHtml(author)}</span>
+            <span class="message-timestamp">${formatTime(time)}</span>
+          </div>
+          <div class="message-text">${escapeHtml(cleanText)}</div>
+        </div>
+      `;
+    } else {
+      div.innerHTML = `
+        <div class="message-avatar"></div>
+        <div class="message-body">
+          <div class="message-text">${escapeHtml(cleanText)}</div>
+        </div>
+      `;
+    }
+
     messagesEl.appendChild(div);
+    lastMessageAuthor = author;
+    lastMessageTime = timeMs;
 
-    // Auto-scroll if near bottom
     if (!isHistory) {
       const threshold = msgContainer.scrollHeight - msgContainer.scrollTop - msgContainer.clientHeight;
-      if (threshold < 150) {
-        scrollToBottom();
-      }
+      if (threshold < 150) scrollToBottom();
     }
   }
 
-  function addSystemMessage(text) {
+  function addSystemMessage(text, timestamp) {
     const div = document.createElement('div');
-    div.className = 'message system-msg';
-
-    const textEl = document.createElement('div');
-    textEl.className = 'msg-text';
-    textEl.textContent = text;
-
-    div.appendChild(textEl);
+    div.className = 'message system-message';
+    div.innerHTML = `<div class="message-body"><div class="message-text">${escapeHtml(text)}</div></div>`;
     messagesEl.appendChild(div);
 
+    // Reset grouping
+    lastMessageAuthor = null;
+    lastMessageTime = 0;
+
     const threshold = msgContainer.scrollHeight - msgContainer.scrollTop - msgContainer.clientHeight;
-    if (threshold < 150) {
-      scrollToBottom();
-    }
+    if (threshold < 150) scrollToBottom();
   }
 
-  /**
-   * Add a message to the activity feed (virtual Activity channel).
-   * If the user is currently viewing Activity, render it immediately.
-   */
   function addActivityMessage(text) {
     const timestamp = new Date().toISOString();
     activityMessages.push({ text, timestamp });
-
-    // Keep only last 100 activity items
     while (activityMessages.length > 100) activityMessages.shift();
-
-    // If currently viewing Activity channel, render it
     if (currentChannelId === ACTIVITY_CHANNEL_ID) {
-      const div = document.createElement('div');
-      div.className = 'message system-msg';
-      const header = document.createElement('div');
-      header.className = 'msg-header';
-      const time = document.createElement('span');
-      time.className = 'msg-time';
-      time.textContent = formatTime(timestamp);
-      header.appendChild(time);
-      const textEl = document.createElement('div');
-      textEl.className = 'msg-text';
-      textEl.textContent = text;
-      div.appendChild(header);
-      div.appendChild(textEl);
-      messagesEl.appendChild(div);
-
-      const threshold = msgContainer.scrollHeight - msgContainer.scrollTop - msgContainer.clientHeight;
-      if (threshold < 150) scrollToBottom();
+      addSystemMessage(text, timestamp);
     }
   }
 
@@ -686,183 +799,333 @@
     const text = messageInput.value.trim();
     if (!text) return;
 
-    // Check for bot commands
     if (text.startsWith('!')) {
       const parts = text.slice(1).split(/\s+/);
       send({ type: 'command', command: parts[0], args: parts.slice(1) });
     }
 
-    // Show the message locally immediately (server won't echo it back to us)
-    const now = new Date().toISOString();
-    addChatMessage({
-      username: username,
-      text: text,
-      timestamp: now,
-      source: 'self',
-    });
-
-    // Send to server for broadcast to others + storage
+    addChatMessage({ username, text, timestamp: new Date().toISOString(), source: 'self' });
     send({ type: 'text', text, channelId: currentChannelId });
     messageInput.value = '';
     messageInput.focus();
   }
 
+  // ── Avatar upload ────────────────────────────────────────
+  async function loadMyAvatar() {
+    try {
+      const res = await fetch(`/api/avatar/${encodeURIComponent(username)}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.avatarUrl) {
+          avatarCache[username] = data.avatarUrl + '?t=' + Date.now();
+          myAvatar.src = avatarCache[username];
+          profileAvatar.src = avatarCache[username];
+        }
+      }
+    } catch (e) { console.log('[Avatar] Could not load avatar:', e); }
+  }
+
+  async function uploadAvatar(file) {
+    if (file.size > 2 * 1024 * 1024) {
+      alert('File too large. Max 2MB.');
+      return;
+    }
+    const formData = new FormData();
+    formData.append('avatar', file);
+    formData.append('username', username);
+    formData.append('userId', userId);
+    try {
+      const res = await fetch('/api/avatar/upload', { method: 'POST', body: formData });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.avatarUrl) {
+          avatarCache[username] = data.avatarUrl + '?t=' + Date.now();
+          myAvatar.src = avatarCache[username];
+          profileAvatar.src = avatarCache[username];
+          renderMembers();
+          renderChannels();
+          // Broadcast to other users via WebSocket
+          send({ type: 'avatar_changed', avatarUrl: data.avatarUrl });
+        }
+      } else {
+        alert('Upload failed: ' + (await res.text()));
+      }
+    } catch (e) { alert('Upload error: ' + e.message); }
+  }
+
+  async function removeAvatar() {
+    try {
+      const res = await fetch('/api/avatar/remove', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, userId }),
+      });
+      if (res.ok) {
+        avatarCache[username] = DEFAULT_AVATAR;
+        myAvatar.src = DEFAULT_AVATAR;
+        profileAvatar.src = DEFAULT_AVATAR;
+        renderMembers();
+        renderChannels();
+        // Broadcast removal to other users
+        send({ type: 'avatar_changed', avatarUrl: DEFAULT_AVATAR });
+      }
+    } catch (e) { console.error('[Avatar] Remove error:', e); }
+  }
+
+  // ── Settings Modal ───────────────────────────────────────
+  function openSettings(tab) {
+    settingsModal.classList.remove('hidden');
+    switchSettingsTab(tab || 'profile');
+    populateAudioDevices();
+    syncVoiceSettingsUI();
+  }
+
+  function closeSettings() {
+    settingsModal.classList.add('hidden');
+    stopVoiceTest();
+  }
+
+  function switchSettingsTab(tabName) {
+    document.querySelectorAll('.settings-nav-item').forEach(el => el.classList.toggle('active', el.dataset.tab === tabName));
+    document.querySelectorAll('.settings-tab').forEach(el => el.classList.toggle('active', el.id === 'tab-' + tabName));
+  }
+
+  async function populateAudioDevices() {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      voiceInputDevice.innerHTML = '<option value="default">Default</option>';
+      voiceOutputDevice.innerHTML = '<option value="default">Default</option>';
+      devices.forEach(d => {
+        if (d.kind === 'audioinput') {
+          const opt = document.createElement('option');
+          opt.value = d.deviceId;
+          opt.textContent = d.label || `Microphone ${voiceInputDevice.options.length}`;
+          if (d.deviceId === voiceSettings.inputDeviceId) opt.selected = true;
+          voiceInputDevice.appendChild(opt);
+        } else if (d.kind === 'audiooutput') {
+          const opt = document.createElement('option');
+          opt.value = d.deviceId;
+          opt.textContent = d.label || `Speaker ${voiceOutputDevice.options.length}`;
+          if (d.deviceId === voiceSettings.outputDeviceId) opt.selected = true;
+          voiceOutputDevice.appendChild(opt);
+        }
+      });
+    } catch (e) { console.error('[Settings] Could not enumerate devices:', e); }
+  }
+
+  function syncVoiceSettingsUI() {
+    voiceInputVolume.value = voiceSettings.inputVolume;
+    voiceInputVolumeVal.textContent = voiceSettings.inputVolume + '%';
+    voiceOutputVolume.value = voiceSettings.outputVolume;
+    voiceOutputVolumeVal.textContent = voiceSettings.outputVolume + '%';
+    voiceVadThreshold.value = voiceSettings.vadThreshold;
+    voiceVadThresholdVal.textContent = voiceSettings.vadThreshold;
+    voiceEchoCancel.checked = voiceSettings.echoCancellation;
+    voiceNoiseSuppress.checked = voiceSettings.noiseSuppression;
+    voiceAutoGain.checked = voiceSettings.autoGainControl;
+  }
+
+  // Voice test microphone
+  let testStream = null;
+  let testContext = null;
+  let testAnalyser = null;
+  let testRaf = null;
+
+  function startVoiceTest() {
+    stopVoiceTest();
+    navigator.mediaDevices.getUserMedia({
+      audio: { deviceId: voiceSettings.inputDeviceId !== 'default' ? { exact: voiceSettings.inputDeviceId } : undefined }
+    }).then(stream => {
+      testStream = stream;
+      testContext = new AudioContext();
+      testAnalyser = testContext.createAnalyser();
+      testAnalyser.fftSize = 256;
+      const src = testContext.createMediaStreamSource(stream);
+      src.connect(testAnalyser);
+      const data = new Uint8Array(testAnalyser.frequencyBinCount);
+      const meterFill = voiceTestMeter.querySelector('.voice-meter-fill');
+      function tick() {
+        testAnalyser.getByteFrequencyData(data);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) sum += data[i];
+        const avg = sum / data.length;
+        meterFill.style.width = Math.min(100, avg / 128 * 100) + '%';
+        testRaf = requestAnimationFrame(tick);
+      }
+      tick();
+      voiceTestBtn.textContent = 'Stop Test';
+    }).catch(e => console.error('[VoiceTest]', e));
+  }
+
+  function stopVoiceTest() {
+    if (testRaf) { cancelAnimationFrame(testRaf); testRaf = null; }
+    if (testStream) { testStream.getTracks().forEach(t => t.stop()); testStream = null; }
+    if (testContext) { testContext.close().catch(() => {}); testContext = null; }
+    const meterFill = voiceTestMeter.querySelector('.voice-meter-fill');
+    if (meterFill) meterFill.style.width = '0%';
+    voiceTestBtn.textContent = 'Test Microphone';
+  }
+
   // ── Event Listeners ──────────────────────────────────────
+  // Login
   loginBtn.addEventListener('click', () => {
     hideError();
     const name = usernameInput.value.trim();
-    if (!name) {
-      showError('Please enter a username');
-      return;
-    }
-    if (name.length < 2) {
-      showError('Username must be at least 2 characters');
-      return;
-    }
+    if (!name) { showError('Please enter a username'); return; }
+    if (name.length < 2) { showError('Username must be at least 2 characters'); return; }
     username = name;
     reconnectAttempts = 0;
     connect();
   });
+  usernameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') loginBtn.click(); });
 
-  usernameInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') loginBtn.click();
-  });
-
+  // Chat
   sendBtn.addEventListener('click', sendMessage);
-
   messageInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
   });
 
-  disconnectBtn.addEventListener('click', disconnect);
+  // Sidebar toggle (mobile)
+  toggleSidebar.addEventListener('click', () => sidebar.classList.toggle('open'));
 
-  toggleSidebar.addEventListener('click', () => {
-    sidebar.classList.toggle('open');
+  // Member list toggle
+  membersToggle.addEventListener('click', () => {
+    memberListVisible = !memberListVisible;
+    memberList.classList.toggle('hidden-panel', !memberListVisible);
+    membersToggle.classList.toggle('active', memberListVisible);
   });
 
-  // ── Channel Management ───────────────────────────────────
-  addChannelBtn.addEventListener('click', () => {
-    channelDialog.classList.toggle('hidden');
-    if (!channelDialog.classList.contains('hidden')) {
-      channelNameInput.value = '';
-      channelNameInput.focus();
-    }
-  });
-
-  channelCancelBtn.addEventListener('click', () => {
-    channelDialog.classList.add('hidden');
-  });
-
+  // Channel dialog
+  channelCancelBtn.addEventListener('click', () => channelDialog.classList.add('hidden'));
   channelSaveBtn.addEventListener('click', () => {
     const name = channelNameInput.value.trim();
     if (name) {
-      send({ type: 'create_channel', name, parentId: 0 });
+      const parentId = parseInt(channelCategorySelect.value) || 0;
+      send({ type: 'create_channel', name, parentId });
       channelDialog.classList.add('hidden');
     }
   });
-
   channelNameInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') channelSaveBtn.click();
     if (e.key === 'Escape') channelCancelBtn.click();
   });
 
-  // Close sidebar when clicking outside on mobile
+  // Settings modal
+  settingsBtn.addEventListener('click', () => openSettings('profile'));
+  settingsClose.addEventListener('click', closeSettings);
+  settingsLogout.addEventListener('click', () => { closeSettings(); disconnect(); });
+  document.querySelector('.modal-backdrop')?.addEventListener('click', closeSettings);
+  document.querySelectorAll('.settings-nav-item[data-tab]').forEach(el => {
+    el.addEventListener('click', () => switchSettingsTab(el.dataset.tab));
+  });
+
+  // Avatar upload
+  avatarUpload.addEventListener('change', (e) => {
+    if (e.target.files[0]) uploadAvatar(e.target.files[0]);
+  });
+  avatarRemove.addEventListener('click', removeAvatar);
+
+  // Voice settings handlers
+  voiceInputDevice.addEventListener('change', () => { voiceSettings.inputDeviceId = voiceInputDevice.value; saveVoiceSettings(); });
+  voiceOutputDevice.addEventListener('change', () => { voiceSettings.outputDeviceId = voiceOutputDevice.value; saveVoiceSettings(); });
+  voiceInputVolume.addEventListener('input', () => {
+    voiceSettings.inputVolume = parseInt(voiceInputVolume.value);
+    voiceInputVolumeVal.textContent = voiceSettings.inputVolume + '%';
+    saveVoiceSettings();
+  });
+  voiceOutputVolume.addEventListener('input', () => {
+    voiceSettings.outputVolume = parseInt(voiceOutputVolume.value);
+    voiceOutputVolumeVal.textContent = voiceSettings.outputVolume + '%';
+    saveVoiceSettings();
+    if (gainNode) gainNode.gain.value = voiceSettings.outputVolume / 100;
+  });
+  voiceVadThreshold.addEventListener('input', () => {
+    voiceSettings.vadThreshold = parseInt(voiceVadThreshold.value);
+    voiceVadThresholdVal.textContent = voiceSettings.vadThreshold;
+    saveVoiceSettings();
+  });
+  voiceEchoCancel.addEventListener('change', () => { voiceSettings.echoCancellation = voiceEchoCancel.checked; saveVoiceSettings(); });
+  voiceNoiseSuppress.addEventListener('change', () => { voiceSettings.noiseSuppression = voiceNoiseSuppress.checked; saveVoiceSettings(); });
+  voiceAutoGain.addEventListener('change', () => { voiceSettings.autoGainControl = voiceAutoGain.checked; saveVoiceSettings(); });
+  voiceTestBtn.addEventListener('click', () => { testStream ? stopVoiceTest() : startVoiceTest(); });
+
+  // Appearance
+  appearanceFontSize.addEventListener('change', () => {
+    const sizes = { small: '13px', normal: '15px', large: '18px' };
+    document.documentElement.style.fontSize = sizes[appearanceFontSize.value] || '15px';
+    localStorage.setItem('fontSize', appearanceFontSize.value);
+  });
+  appearanceCompact.addEventListener('change', () => {
+    document.body.classList.toggle('compact-mode', appearanceCompact.checked);
+    localStorage.setItem('compactMode', appearanceCompact.checked);
+  });
+
+  // Load appearance prefs
+  const savedFontSize = localStorage.getItem('fontSize');
+  if (savedFontSize) {
+    appearanceFontSize.value = savedFontSize;
+    const sizes = { small: '13px', normal: '15px', large: '18px' };
+    document.documentElement.style.fontSize = sizes[savedFontSize] || '15px';
+  }
+  const savedCompact = localStorage.getItem('compactMode');
+  if (savedCompact === 'true') {
+    appearanceCompact.checked = true;
+    document.body.classList.add('compact-mode');
+  }
+
+  // Close sidebar on outside click (mobile)
   document.addEventListener('click', (e) => {
-    if (sidebar.classList.contains('open') &&
-        !sidebar.contains(e.target) &&
-        e.target !== toggleSidebar) {
+    if (sidebar.classList.contains('open') && !sidebar.contains(e.target) && e.target !== toggleSidebar) {
       sidebar.classList.remove('open');
     }
   });
 
-  // Check for username URL parameter (e.g., ?username=PlayerName)
+  // URL param login
   const urlParams = new URLSearchParams(window.location.search);
   const urlUsername = urlParams.get('username');
-  if (urlUsername && urlUsername.trim().length >= 2) {
-    usernameInput.value = urlUsername.trim();
-  }
-
-  // Focus username input on load
+  if (urlUsername && urlUsername.trim().length >= 2) usernameInput.value = urlUsername.trim();
   usernameInput.focus();
 
-  // ── Voice Chat (WebSocket audio + Mumble) ────────────────
-  // No WebRTC. Audio goes: Mic → AudioWorklet → WebSocket binary → Mumble.
-  // And back:              Mumble → WebSocket binary → AudioWorklet → Speaker.
+  // ── Voice Chat ───────────────────────────────────────────
   let audioContext = null;
   let voiceWorklet = null;
   let micStream = null;
   let voiceActive = false;
   let isMuted = false;
   let isDeafened = false;
-  let sendBuffer = new Int16Array(0); // Accumulate mic samples until we have 960
+  let gainNode = null;
 
-  const voiceConnectBtn  = $('#voice-connect-btn');
-  const voiceActiveCtrl  = $('#voice-active-controls');
-  const muteBtn          = $('#mute-btn');
-  const deafenBtn        = $('#deafen-btn');
-  const voiceDisconnect  = $('#voice-disconnect-btn');
-  const voiceStatus      = $('#voice-status');
-  const headerVoiceBtn   = $('#header-voice-btn');
-  const headerVoiceStatus = $('#header-voice-status');
-
-  function setVoiceStatus(text, state) {
-    voiceStatus.textContent = text;
-    voiceStatus.className = 'voice-status' + (state ? ' ' + state : '');
-    if (state === 'connected') {
-      headerVoiceBtn.textContent = '🎤 Connected';
-      headerVoiceBtn.classList.add('connected');
-      headerVoiceStatus.textContent = '';
-      headerVoiceStatus.classList.add('hidden');
-    } else if (state === 'error') {
-      headerVoiceBtn.textContent = '🎤 Join Voice';
-      headerVoiceBtn.classList.remove('connected', 'hidden');
-      headerVoiceStatus.textContent = text;
-      headerVoiceStatus.className = 'header-voice-status error';
-    } else if (text === 'Not connected') {
-      headerVoiceBtn.textContent = '🎤 Join Voice';
-      headerVoiceBtn.classList.remove('connected', 'hidden');
-      headerVoiceStatus.classList.add('hidden');
-    }
-  }
-
-  async function startVoice() {
+  async function startVoice(voiceChannelId) {
     if (voiceActive) return;
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      const errMsg = 'Your browser does not support voice chat. Use a modern browser with HTTPS.';
-      setVoiceStatus(errMsg, 'error');
-      addSystemMessage('🎤 ' + errMsg);
+      addActivityMessage('🎤 Your browser does not support voice chat.');
       return;
     }
 
     try {
-      setVoiceStatus('Requesting microphone...', '');
-      addSystemMessage('🎤 Requesting microphone access...');
+      addActivityMessage('🎤 Requesting microphone access...');
 
-      micStream = await navigator.mediaDevices.getUserMedia({
+      const constraints = {
         audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
+          echoCancellation: voiceSettings.echoCancellation,
+          noiseSuppression: voiceSettings.noiseSuppression,
+          autoGainControl: voiceSettings.autoGainControl,
           sampleRate: 48000,
           channelCount: 1,
         },
         video: false,
-      });
+      };
+      if (voiceSettings.inputDeviceId && voiceSettings.inputDeviceId !== 'default') {
+        constraints.audio.deviceId = { exact: voiceSettings.inputDeviceId };
+      }
 
-      setVoiceStatus('Connecting...', '');
-      addSystemMessage('🎤 Microphone access granted, connecting to voice...');
+      micStream = await navigator.mediaDevices.getUserMedia(constraints);
+      addActivityMessage('🎤 Connecting to voice...');
 
-      // Create AudioContext at 48kHz (matches Mumble)
       audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
-
-      // Load our AudioWorklet
       await audioContext.audioWorklet.addModule('/js/voice-processor.js');
 
-      // Create worklet node — 1 input (mic), 1 output (speakers)
       voiceWorklet = new AudioWorkletNode(audioContext, 'voice-processor', {
         numberOfInputs: 1,
         numberOfOutputs: 1,
@@ -870,154 +1133,201 @@
         processorOptions: {},
       });
 
-      // Mic → worklet (capture)
+      // Mic → worklet
       const micSource = audioContext.createMediaStreamSource(micStream);
       micSource.connect(voiceWorklet);
 
-      // Worklet → speakers (playback)
-      voiceWorklet.connect(audioContext.destination);
+      // Worklet → gain → speakers
+      gainNode = audioContext.createGain();
+      gainNode.gain.value = voiceSettings.outputVolume / 100;
+      voiceWorklet.connect(gainNode);
+      gainNode.connect(audioContext.destination);
 
-      // When worklet captures mic audio, accumulate and send in 960-sample chunks
-      // Only send frames that contain actual voice (basic energy-based VAD)
-      sendBuffer = new Int16Array(0);
+      // Handle captured audio — zero-alloc ring buffer accumulation
+      const vadThreshold = voiceSettings.vadThreshold;
+      const inputVolumeScale = voiceSettings.inputVolume / 100;
+      const FRAME_SIZE = 960;               // 20ms @ 48kHz
+      const SEND_RING_SIZE = FRAME_SIZE * 6; // 6 frames of headroom
+      const sendRing = new Int16Array(SEND_RING_SIZE);
+      const sendFrame = new Int16Array(FRAME_SIZE);
+      let sendWPos = 0;
+      let sendRPos = 0;
+      let sendBuffered = 0;
+
       voiceWorklet.port.onmessage = (e) => {
         if (e.data.type === 'capture' && ws && ws.readyState === WebSocket.OPEN) {
-          // Accumulate samples
           const incoming = e.data.samples;
-          const merged = new Int16Array(sendBuffer.length + incoming.length);
-          merged.set(sendBuffer);
-          merged.set(incoming, sendBuffer.length);
-          sendBuffer = merged;
 
-          // Send complete 960-sample frames (20ms at 48kHz)
-          while (sendBuffer.length >= 960) {
-            const frame = sendBuffer.slice(0, 960);
-            sendBuffer = sendBuffer.slice(960);
-
-            // Voice Activity Detection — skip silence frames
-            // Compute RMS energy of the frame
-            let sumSq = 0;
-            for (let i = 0; i < frame.length; i++) {
-              sumSq += frame[i] * frame[i];
+          // Apply input volume
+          if (inputVolumeScale !== 1) {
+            for (let i = 0; i < incoming.length; i++) {
+              incoming[i] = Math.max(-32768, Math.min(32767, Math.round(incoming[i] * inputVolumeScale)));
             }
-            const rms = Math.sqrt(sumSq / frame.length);
-            // Threshold ~200 out of 32768 — catches actual speech, rejects noise floor
-            if (rms < 200) continue;
+          }
 
-            // Send as raw binary over WebSocket
-            ws.send(frame.buffer);
+          // Write to ring buffer (avoids array concatenation / GC pressure)
+          for (let i = 0; i < incoming.length; i++) {
+            sendRing[sendWPos] = incoming[i];
+            sendWPos = (sendWPos + 1) % SEND_RING_SIZE;
+          }
+          sendBuffered += incoming.length;
+
+          // Extract complete 20ms frames
+          while (sendBuffered >= FRAME_SIZE) {
+            for (let i = 0; i < FRAME_SIZE; i++) {
+              sendFrame[i] = sendRing[sendRPos];
+              sendRPos = (sendRPos + 1) % SEND_RING_SIZE;
+            }
+            sendBuffered -= FRAME_SIZE;
+
+            // VAD — skip silent frames
+            let sumSq = 0;
+            for (let i = 0; i < FRAME_SIZE; i++) sumSq += sendFrame[i] * sendFrame[i];
+            const rms = Math.sqrt(sumSq / FRAME_SIZE);
+            if (rms < vadThreshold) continue;
+
+            // Copy frame buffer for async WebSocket send
+            ws.send(sendFrame.buffer.slice(0));
           }
         }
       };
 
-      // Tell the server to start our Mumble voice session
-      send({ type: 'voice_start' });
+      send({ type: 'voice_start', voiceChannelId: voiceChannelId || currentVoiceChannelId });
       voiceActive = true;
+      stopPolling(); // Pause message polling while in voice to reduce event loop contention
 
-      // UI updates
-      setVoiceStatus('Connected', 'connected');
-      voiceConnectBtn.classList.add('hidden');
-      voiceActiveCtrl.classList.remove('hidden');
-      addSystemMessage('🎤 Voice connected!');
+      // Show voice status in sidebar
+      showVoiceStatus(true);
+      addActivityMessage('🎤 Voice connected!' + (voiceChannelId ? ` (${channels.get(voiceChannelId)?.name || 'Voice'})` : ''));
 
     } catch (err) {
       console.error('[Voice] Error:', err);
       let errorMsg = err.message || 'Unknown error';
-      if (err.name === 'NotAllowedError') {
-        errorMsg = 'Microphone permission denied. Please allow microphone access.';
-      } else if (err.name === 'NotFoundError') {
-        errorMsg = 'No microphone found. Please connect a microphone.';
-      } else if (err.name === 'NotReadableError') {
-        errorMsg = 'Microphone is in use by another application.';
-      }
-      setVoiceStatus('Failed: ' + errorMsg, 'error');
-      addSystemMessage('🎤 Voice error: ' + errorMsg);
+      if (err.name === 'NotAllowedError') errorMsg = 'Microphone permission denied.';
+      else if (err.name === 'NotFoundError') errorMsg = 'No microphone found.';
+      else if (err.name === 'NotReadableError') errorMsg = 'Microphone is in use.';
+      addActivityMessage('🎤 Voice error: ' + errorMsg);
       stopVoice();
     }
   }
 
-  /**
-   * Handle incoming binary audio from server (PCM Int16LE from Mumble).
-   * Convert to Float32 and push to the AudioWorklet for playback.
-   */
   function handleAudioFromServer(data) {
     if (!voiceWorklet || isDeafened) return;
-
     const int16 = new Int16Array(data);
     const float32 = new Float32Array(int16.length);
-    for (let i = 0; i < int16.length; i++) {
-      float32[i] = int16[i] / 32768;
-    }
-
-    // Send to worklet for playback
+    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
     voiceWorklet.port.postMessage({ type: 'playback', samples: float32 }, [float32.buffer]);
   }
 
   function stopVoice() {
     voiceActive = false;
-    sendBuffer = new Int16Array(0);
-
-    if (micStream) {
-      micStream.getTracks().forEach(t => t.stop());
-      micStream = null;
-    }
-    if (voiceWorklet) {
-      voiceWorklet.disconnect();
-      voiceWorklet = null;
-    }
-    if (audioContext) {
-      audioContext.close().catch(() => {});
-      audioContext = null;
-    }
-
+    currentVoiceChannelId = null;
+    startPolling(); // Resume message polling now that voice is off
+    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+    if (voiceWorklet) { voiceWorklet.disconnect(); voiceWorklet = null; }
+    if (gainNode) { gainNode.disconnect(); gainNode = null; }
+    if (audioContext) { audioContext.close().catch(() => {}); audioContext = null; }
     isMuted = false;
     isDeafened = false;
-    muteBtn.classList.remove('muted');
-    muteBtn.textContent = '🎤';
-    deafenBtn.classList.remove('muted');
-    deafenBtn.textContent = '🔊';
-
-    voiceConnectBtn.classList.remove('hidden');
-    voiceActiveCtrl.classList.add('hidden');
-    setVoiceStatus('Not connected', '');
-
+    updateMuteDeafenUI();
+    showVoiceStatus(false);
     send({ type: 'voice_stop' });
+    addActivityMessage('Voice disconnected');
+    renderChannels();
+  }
+
+  function showVoiceStatus(connected) {
+    // Insert/remove voice status bar above user panel
+    const existing = document.querySelector('.voice-status');
+    if (existing) existing.remove();
+
+    if (connected) {
+      const chName = currentVoiceChannelId ? (channels.get(currentVoiceChannelId)?.name || 'Voice') : 'Voice';
+      const vs = document.createElement('div');
+      vs.className = 'voice-status';
+      vs.innerHTML = `
+        <div class="voice-status-header">
+          <span class="voice-status-text">Voice Connected</span>
+          <button class="voice-disconnect-btn" title="Disconnect">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm5 11H7v-2h10v2z"/></svg>
+          </button>
+        </div>
+        <span class="voice-status-channel">${escapeHtml(chName)}</span>
+      `;
+      vs.querySelector('.voice-disconnect-btn').addEventListener('click', stopVoice);
+      const userPanel = document.querySelector('.user-panel');
+      userPanel.parentNode.insertBefore(vs, userPanel);
+    }
+
+    headerVoiceBtn.title = connected ? 'Disconnect voice' : 'Join voice chat';
+  }
+
+  function updateMuteDeafenUI() {
+    // Mute button
+    muteBtn.classList.toggle('active-red', isMuted);
+    muteBtn.title = isMuted ? 'Unmute' : 'Mute';
+    if (isMuted) {
+      muteBtn.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+        <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+        <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+        <line x1="3" y1="3" x2="21" y2="21" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+      </svg>`;
+    } else {
+      muteBtn.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+        <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+        <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+      </svg>`;
+    }
+    // Deafen button
+    deafenBtn.classList.toggle('active-red', isDeafened);
+    deafenBtn.title = isDeafened ? 'Undeafen' : 'Deafen';
+    if (isDeafened) {
+      deafenBtn.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+        <path d="M12 1a9 9 0 0 0-9 9v7c0 1.66 1.34 3 3 3h3v-8H5v-2c0-3.87 3.13-7 7-7s7 3.13 7 7v2h-4v8h3c1.66 0 3-1.34 3-3v-7a9 9 0 0 0-9-9z"/>
+        <line x1="3" y1="3" x2="21" y2="21" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+      </svg>`;
+    } else {
+      deafenBtn.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+        <path d="M12 1a9 9 0 0 0-9 9v7c0 1.66 1.34 3 3 3h3v-8H5v-2c0-3.87 3.13-7 7-7s7 3.13 7 7v2h-4v8h3c1.66 0 3-1.34 3-3v-7a9 9 0 0 0-9-9z"/>
+      </svg>`;
+    }
   }
 
   function toggleMute() {
-    if (!micStream) return;
+    if (!voiceActive) return;
     isMuted = !isMuted;
-    micStream.getAudioTracks().forEach(t => t.enabled = !isMuted);
-    if (voiceWorklet) {
-      voiceWorklet.port.postMessage({ type: 'mute', muted: isMuted });
-    }
-    muteBtn.classList.toggle('muted', isMuted);
-    muteBtn.textContent = isMuted ? '🚫' : '🎤';
-    muteBtn.title = isMuted ? 'Unmute' : 'Mute';
-    addSystemMessage(isMuted ? '🔇 Microphone muted' : '🎤 Microphone unmuted');
+    if (micStream) micStream.getAudioTracks().forEach(t => t.enabled = !isMuted);
+    if (voiceWorklet) voiceWorklet.port.postMessage({ type: 'mute', muted: isMuted });
+    updateMuteDeafenUI();
+    addActivityMessage(isMuted ? '🔇 Microphone muted' : '🎤 Microphone unmuted');
   }
 
   function toggleDeafen() {
     if (!voiceActive) return;
     isDeafened = !isDeafened;
-    deafenBtn.classList.toggle('muted', isDeafened);
-    deafenBtn.textContent = isDeafened ? '🔇' : '🔊';
-    deafenBtn.title = isDeafened ? 'Undeafen' : 'Deafen';
     if (isDeafened && !isMuted) toggleMute();
-    addSystemMessage(isDeafened ? '🔇 Deafened' : '🔊 Undeafened');
+    if (!isDeafened && isMuted) toggleMute();
+    updateMuteDeafenUI();
+    addActivityMessage(isDeafened ? '🔇 Deafened' : '🔊 Undeafened');
   }
 
-  // Wire up voice buttons
-  voiceConnectBtn.addEventListener('click', startVoice);
+  // Voice button handlers
   headerVoiceBtn.addEventListener('click', () => {
     if (voiceActive) {
       stopVoice();
     } else {
-      startVoice();
+      // Find the first voice channel and join it
+      const voiceCh = Array.from(channels.values()).find(ch =>
+        ch.name && (ch.name.toLowerCase().includes('voice') || ch.name.toLowerCase().includes('afk'))
+      );
+      if (voiceCh) {
+        joinVoiceChannel(voiceCh.id);
+      } else {
+        addActivityMessage('No voice channels available');
+      }
     }
   });
   muteBtn.addEventListener('click', toggleMute);
   deafenBtn.addEventListener('click', toggleDeafen);
-  voiceDisconnect.addEventListener('click', stopVoice);
 
 })();

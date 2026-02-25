@@ -28,7 +28,8 @@ class VoiceProcessor extends AudioWorkletProcessor {
     // ── Jitter buffer ──
     // Wait until we have at least this many samples before we start playing.
     // This absorbs network timing variations. 960 samples = 20ms = 1 Opus frame.
-    this._jitterThreshold = 960 * 2; // 40ms — 2 Opus frames
+    // With 3+ users, server-side decode+send timing varies more, so we buffer 3 frames.
+    this._jitterThreshold = 960 * 3; // 60ms — 3 Opus frames
     this._playing = false;
 
     this.port.onmessage = (e) => {

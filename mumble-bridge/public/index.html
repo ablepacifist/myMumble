@@ -24,58 +24,51 @@
     </div>
   </div>
 
-  <!-- MAIN CHAT SCREEN -->
+  <!-- MAIN CHAT SCREEN (Discord layout) -->
   <div id="chat-screen" class="screen">
-    <!-- Sidebar -->
+    <!-- Server/Channel Sidebar -->
     <aside id="sidebar">
-      <div class="sidebar-header">
-        <h2>🎮 IPG</h2>
+      <!-- Server Header -->
+      <div class="sidebar-header" id="server-header">
+        <h2>Idiots Play Games</h2>
         <span id="connection-status" class="status-dot disconnected" title="Disconnected"></span>
       </div>
 
-      <!-- Channels -->
-      <div class="sidebar-section">
-        <h3>Channels <button id="add-channel-btn" class="btn-icon-inline" title="Create channel">＋</button></h3>
-        <ul id="channel-list" class="channel-list"></ul>
-      </div>
+      <!-- Channel List (Discord-style with categories) -->
+      <div class="channel-tree" id="channel-tree"></div>
 
-      <!-- Channel Create/Edit Dialog (hidden by default) -->
+      <!-- Channel Create Dialog -->
       <div id="channel-dialog" class="sidebar-dialog hidden">
-        <input type="text" id="channel-name-input" placeholder="Channel name" maxlength="50">
+        <select id="channel-category-select">
+          <option value="0">No Category (Root)</option>
+        </select>
+        <input type="text" id="channel-name-input" placeholder="channel-name" maxlength="50">
+        <label class="checkbox-label"><input type="checkbox" id="channel-voice-check"> Voice Channel</label>
         <div class="dialog-actions">
           <button id="channel-save-btn" class="btn btn-small btn-primary">Create</button>
           <button id="channel-cancel-btn" class="btn btn-small">Cancel</button>
         </div>
       </div>
 
-      <!-- Online Users -->
-      <div class="sidebar-section">
-        <h3>Online <span id="user-count" class="badge">0</span></h3>
-        <ul id="user-list" class="user-list"></ul>
-      </div>
-
-      <!-- Voice Controls -->
-      <div class="sidebar-section voice-section">
-        <h3>Voice</h3>
-        <div class="voice-controls">
-          <button id="voice-connect-btn" class="btn btn-voice" title="Connect to voice">
-            <span class="voice-icon">🎤</span>
-            <span class="voice-label">Join Voice</span>
-          </button>
-          <div id="voice-active-controls" class="hidden">
-            <button id="mute-btn" class="btn btn-voice-sm" title="Mute">🎤</button>
-            <button id="deafen-btn" class="btn btn-voice-sm" title="Deafen">🔊</button>
-            <button id="voice-disconnect-btn" class="btn btn-voice-sm btn-danger" title="Disconnect voice">📵</button>
+      <!-- User Panel (bottom of sidebar — like Discord) -->
+      <div class="user-panel" id="user-panel">
+        <div class="user-panel-info" id="user-panel-info">
+          <img id="my-avatar" class="avatar avatar-sm" src="/uploads/avatars/default.jpg" alt="">
+          <div class="user-panel-names">
+            <span id="my-username" class="my-name"></span>
+            <span class="my-status">Online</span>
           </div>
-          <div id="voice-status" class="voice-status">Not connected</div>
         </div>
-      </div>
-
-      <!-- User Controls -->
-      <div class="sidebar-footer">
-        <div class="user-controls">
-          <span id="my-username" class="my-name"></span>
-          <button id="disconnect-btn" class="btn btn-small btn-danger" title="Disconnect">✕</button>
+        <div class="user-panel-buttons">
+          <button id="mute-btn" class="panel-btn" title="Mute">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+          </button>
+          <button id="deafen-btn" class="panel-btn" title="Deafen">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a9 9 0 0 0-9 9v7c0 1.66 1.34 3 3 3h3v-8H5v-2c0-3.87 3.13-7 7-7s7 3.13 7 7v2h-4v8h3c1.66 0 3-1.34 3-3v-7a9 9 0 0 0-9-9z"/></svg>
+          </button>
+          <button id="settings-btn" class="panel-btn" title="User Settings">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+          </button>
         </div>
       </div>
     </aside>
@@ -84,33 +77,145 @@
     <main id="main-content">
       <!-- Channel Header -->
       <div id="channel-header">
-        <h2 id="current-channel-name">#Root</h2>
+        <div class="channel-header-left">
+          <span class="channel-hash">#</span>
+          <h2 id="current-channel-name">general</h2>
+        </div>
         <div class="header-actions">
-          <button id="header-voice-btn" class="btn btn-voice-header" title="Join voice chat">🎤 Join Voice</button>
-          <span id="header-voice-status" class="header-voice-status hidden"></span>
-          <button id="toggle-sidebar-btn" class="btn btn-icon" title="Toggle sidebar">☰</button>
+          <button id="header-voice-btn" class="header-btn" title="Join voice chat">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+          </button>
+          <button id="members-toggle" class="header-btn active" title="Toggle member list">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
+          </button>
+          <button id="toggle-sidebar-btn" class="header-btn mobile-only" title="Toggle sidebar">☰</button>
         </div>
       </div>
 
-      <!-- Messages -->
-      <div id="messages-container">
-        <div id="messages" role="log" aria-live="polite"></div>
-        <div id="typing-indicator" class="hidden">
-          <span class="typing-dots"><span>.</span><span>.</span><span>.</span></span>
-        </div>
-      </div>
+      <!-- Main content area (messages + optional member list) -->
+      <div class="content-body">
+        <!-- Messages area -->
+        <div class="messages-area">
+          <div id="messages-container">
+            <div id="messages" role="log" aria-live="polite"></div>
+          </div>
 
-      <!-- Input Bar -->
-      <div id="input-bar">
-        <div class="input-wrapper">
-          <input type="text" id="message-input" placeholder="Type a message..." autocomplete="off" maxlength="2000" disabled>
-          <button id="send-btn" class="btn btn-primary" disabled>Send</button>
+          <!-- Input Bar -->
+          <div id="input-bar">
+            <div class="input-wrapper">
+              <input type="text" id="message-input" placeholder="Message #general" autocomplete="off" maxlength="2000" disabled>
+              <button id="send-btn" class="btn btn-primary" disabled>
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+              </button>
+            </div>
+          </div>
         </div>
-        <div class="input-hints">
-          <span>Type <code>!help</code> for bot commands</span>
-        </div>
+
+        <!-- Member List (right panel, toggleable) -->
+        <aside id="member-list" class="member-list">
+          <div id="member-list-content"></div>
+        </aside>
       </div>
     </main>
+  </div>
+
+  <!-- Settings Modal -->
+  <div id="settings-modal" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content">
+      <div class="modal-sidebar">
+        <ul class="settings-nav">
+          <li class="settings-nav-item active" data-tab="profile">My Profile</li>
+          <li class="settings-nav-item" data-tab="voice">Voice & Audio</li>
+          <li class="settings-nav-item" data-tab="appearance">Appearance</li>
+          <li class="settings-nav-divider"></li>
+          <li class="settings-nav-item danger" id="settings-logout">Log Out</li>
+        </ul>
+      </div>
+      <div class="modal-body">
+        <button class="modal-close" id="settings-close">&times;</button>
+
+        <!-- Profile Tab -->
+        <div class="settings-tab active" id="tab-profile">
+          <h2>My Profile</h2>
+          <div class="profile-card">
+            <div class="profile-avatar-section">
+              <img id="profile-avatar-preview" class="avatar avatar-xl" src="/uploads/avatars/default.jpg" alt="">
+              <div class="avatar-actions">
+                <label class="btn btn-small btn-primary" for="avatar-upload">Change Avatar</label>
+                <input type="file" id="avatar-upload" accept="image/jpeg,image/png,image/gif,image/webp" hidden>
+                <button id="avatar-remove" class="btn btn-small btn-danger">Remove</button>
+              </div>
+              <p class="avatar-hint">JPG, PNG, GIF. Max 2MB.</p>
+            </div>
+            <div class="profile-info">
+              <label>Display Name</label>
+              <input type="text" id="profile-display-name" maxlength="30" class="settings-input">
+              <label>Username</label>
+              <input type="text" id="profile-username" class="settings-input" disabled>
+            </div>
+          </div>
+        </div>
+
+        <!-- Voice Tab -->
+        <div class="settings-tab" id="tab-voice">
+          <h2>Voice &amp; Audio</h2>
+          <div class="settings-group">
+            <label>Input Device</label>
+            <select id="voice-input-device" class="settings-select"></select>
+          </div>
+          <div class="settings-group">
+            <label>Output Device</label>
+            <select id="voice-output-device" class="settings-select"></select>
+          </div>
+          <div class="settings-group">
+            <label>Input Volume</label>
+            <input type="range" id="voice-input-volume" min="0" max="200" value="100" class="settings-range">
+            <span id="voice-input-volume-val">100%</span>
+          </div>
+          <div class="settings-group">
+            <label>Output Volume</label>
+            <input type="range" id="voice-output-volume" min="0" max="200" value="100" class="settings-range">
+            <span id="voice-output-volume-val">100%</span>
+          </div>
+          <div class="settings-group">
+            <label>Voice Activity Sensitivity</label>
+            <input type="range" id="voice-vad-threshold" min="50" max="500" value="200" class="settings-range">
+            <span id="voice-vad-threshold-val">200</span>
+          </div>
+          <div class="settings-group">
+            <label class="checkbox-label"><input type="checkbox" id="voice-echo-cancel" checked> Echo Cancellation</label>
+          </div>
+          <div class="settings-group">
+            <label class="checkbox-label"><input type="checkbox" id="voice-noise-suppress" checked> Noise Suppression</label>
+          </div>
+          <div class="settings-group">
+            <label class="checkbox-label"><input type="checkbox" id="voice-auto-gain" checked> Automatic Gain Control</label>
+          </div>
+          <div class="settings-group">
+            <h3>Voice Test</h3>
+            <button id="voice-test-btn" class="btn btn-small btn-primary">Test Microphone</button>
+            <div id="voice-test-meter" class="voice-meter"><div class="voice-meter-fill"></div></div>
+          </div>
+        </div>
+
+        <!-- Appearance Tab -->
+        <div class="settings-tab" id="tab-appearance">
+          <h2>Appearance</h2>
+          <div class="settings-group">
+            <label>Message Font Size</label>
+            <select id="appearance-font-size" class="settings-select">
+              <option value="small">Small (13px)</option>
+              <option value="normal" selected>Normal (15px)</option>
+              <option value="large">Large (18px)</option>
+            </select>
+          </div>
+          <div class="settings-group">
+            <label class="checkbox-label"><input type="checkbox" id="appearance-compact" > Compact Mode</label>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script src="/js/chat.js?v=3"></script>

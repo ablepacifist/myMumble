@@ -28,9 +28,6 @@ class BridgeWebSocketServer {
 
     this.publicDir = path.join(__dirname, '..', 'public');
     this.voiceBridge = new VoiceBridge();
-
-    // Speaking detection timers per web client
-    this._speakingTimers = new Map();
   }
 
   async start() {
@@ -92,8 +89,6 @@ class BridgeWebSocketServer {
           const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
           if (clientInfo.voicePeerId) {
             this.voiceBridge.handleAudioFromBrowser(clientInfo.voicePeerId, buf);
-            // Speaking indicator — broadcast that this user is speaking
-            this._handleSpeaking(clientInfo);
           }
         } catch (err) {
           console.error('[WS] Audio processing error:', err.message);
@@ -147,28 +142,6 @@ class BridgeWebSocketServer {
       channels: Array.from(this.channels.values()),
       users: Array.from(this.users.values()),
     }));
-  }
-
-  /**
-   * Detect speaking from audio energy and broadcast voice_speaking events.
-   * Since client-side VAD already filters silence, any binary frame = speaking.
-   */
-  _handleSpeaking(clientInfo) {
-    if (!clientInfo.webClientId) return;
-    const id = clientInfo.webClientId;
-
-    if (this._speakingTimers.has(id)) {
-      clearTimeout(this._speakingTimers.get(id));
-    } else {
-      // First frame — broadcast speaking=true
-      this._broadcastAll({ type: 'voice_speaking', id, speaking: true });
-    }
-
-    // After 300ms of no audio, broadcast speaking=false
-    this._speakingTimers.set(id, setTimeout(() => {
-      this._speakingTimers.delete(id);
-      this._broadcastAll({ type: 'voice_speaking', id, speaking: false });
-    }, 300));
   }
 
   _broadcastAll(msg) {

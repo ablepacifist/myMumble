@@ -1,8 +1,13 @@
 /**
  * Client message handler — processes incoming WebSocket messages from web clients.
  */
-const { getBridgePool } = require('./database');
+const { getBridgePool, getMumblePool, getAvatarPath } = require('./database');
 const lexicon = require('./lexicon-client');
+const config = require('./config');
+
+function isSuperUser(username) {
+  return config.superUsers.includes((username || '').toLowerCase());
+}
 
 /**
  * Handle a message from a web client.
@@ -41,11 +46,21 @@ async function handleClientMessage(ws, msg, client, ctx) {
         }
       }
 
+      client.isAdmin = isSuperUser(client.username);
+
       ws.send(JSON.stringify({
         type: 'auth_ok',
         username: client.username,
         userId: client.userId,
+        isAdmin: client.isAdmin,
       }));
+
+      // Look up avatar
+      let avatarUrl = '/uploads/avatars/default.jpg';
+      try {
+        const ap = await getAvatarPath(client.username);
+        if (ap) avatarUrl = ap;
+      } catch (_) {}
 
       const webClientId = `web_${client.userId}`;
       client.webClientId = webClientId;
@@ -54,15 +69,17 @@ async function handleClientMessage(ws, msg, client, ctx) {
         userId: client.userId,
         channelId: client.channelId || 0,
         inVoice: false,
+        voiceChannelId: null,
+        avatarUrl,
         ws,
       });
       ctx.broadcastAll({
         type: 'web_user_join',
-        webClient: { id: webClientId, username: client.username, channelId: client.channelId || 0, inVoice: false },
+        webClient: { id: webClientId, username: client.username, channelId: client.channelId || 0, inVoice: false, avatarUrl },
       });
       const webClientList = [];
       for (const [id, wc] of ctx.webClients) {
-        webClientList.push({ id, username: wc.username, channelId: wc.channelId, inVoice: wc.inVoice });
+        webClientList.push({ id, username: wc.username, channelId: wc.channelId, inVoice: wc.inVoice, voiceChannelId: wc.voiceChannelId, avatarUrl: wc.avatarUrl });
       }
       ws.send(JSON.stringify({ type: 'web_users', webClients: webClientList }));
       break;
@@ -124,21 +141,34 @@ async function handleClientMessage(ws, msg, client, ctx) {
         ws.send(JSON.stringify({ type: 'error', message: 'Not authenticated' }));
         break;
       }
+      if (!client.isAdmin) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Only superusers can create channels' }));
+        break;
+      }
       const channelName = (msg.name || '').trim();
       if (!channelName || channelName.length > 50) {
         ws.send(JSON.stringify({ type: 'error', message: 'Invalid channel name' }));
         break;
       }
       try {
-        // Create channel on Mumble server (parent 0 = root)
-        ctx.mumble.sendMessage('ChannelState', {
-          parent: msg.parentId || 0,
-          name: channelName,
-        });
-        console.log(`[WS] Channel "${channelName}" creation requested by ${client.username}`);
+        // Insert directly into Mumble's MySQL DB (Mumble API rejects due to MissingCertificate)
+        const mumbleDb = getMumblePool();
+        const [maxRow] = await mumbleDb.execute('SELECT MAX(channel_id) AS maxId FROM channels WHERE server_id = 1');
+        const newId = (maxRow[0].maxId || 0) + 1;
+        const parentId = msg.parentId || 0;
+        await mumbleDb.execute(
+          'INSERT INTO channels (server_id, channel_id, parent_id, name, inheritacl) VALUES (1, ?, ?, ?, 1)',
+          [newId, parentId, channelName]
+        );
+        console.log(`[WS] Channel "${channelName}" (id=${newId}) created by ${client.username} via DB`);
+        // Broadcast the new channel to all clients
+        const newCh = { id: newId, name: channelName, parentId };
+        ctx.channels.set(newId, newCh);
+        ctx.broadcastAll({ type: 'channel_update', channel: newCh });
+        ws.send(JSON.stringify({ type: 'channel_created', channel: newCh }));
       } catch (err) {
         console.error(`[WS] Channel create error:`, err.message);
-        ws.send(JSON.stringify({ type: 'error', message: 'Failed to create channel' }));
+        ws.send(JSON.stringify({ type: 'error', message: 'Failed to create channel: ' + err.message }));
       }
       break;
     }
@@ -148,17 +178,27 @@ async function handleClientMessage(ws, msg, client, ctx) {
         ws.send(JSON.stringify({ type: 'error', message: 'Not authenticated' }));
         break;
       }
+      if (!client.isAdmin) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Only superusers can delete channels' }));
+        break;
+      }
       const removeId = msg.channelId;
       if (removeId === 0) {
         ws.send(JSON.stringify({ type: 'error', message: 'Cannot remove the root channel' }));
         break;
       }
       try {
-        ctx.mumble.sendMessage('ChannelRemove', { channelId: removeId });
-        console.log(`[WS] Channel ${removeId} removal requested by ${client.username}`);
+        // Delete from Mumble's MySQL DB (also delete children)
+        const mumbleDb = getMumblePool();
+        await mumbleDb.execute('DELETE FROM channels WHERE server_id = 1 AND parent_id = ?', [removeId]);
+        await mumbleDb.execute('DELETE FROM channels WHERE server_id = 1 AND channel_id = ?', [removeId]);
+        console.log(`[WS] Channel ${removeId} deleted by ${client.username} via DB`);
+        // Remove from in-memory state and broadcast
+        ctx.channels.delete(removeId);
+        ctx.broadcastAll({ type: 'channel_remove', channelId: removeId });
       } catch (err) {
         console.error(`[WS] Channel remove error:`, err.message);
-        ws.send(JSON.stringify({ type: 'error', message: 'Failed to remove channel' }));
+        ws.send(JSON.stringify({ type: 'error', message: 'Failed to remove channel: ' + err.message }));
       }
       break;
     }
@@ -214,17 +254,55 @@ async function handleClientMessage(ws, msg, client, ctx) {
         }
         client.voicePeerId = peerId;
         await ctx.voiceBridge.startSession(peerId, client.username, ws);
+
+        // Move to the requested voice channel if specified
+        const voiceChId = msg.voiceChannelId || null;
+        if (voiceChId !== null) {
+          ctx.voiceBridge.moveToChannel(peerId, voiceChId);
+        }
+
         ws.send(JSON.stringify({ type: 'voice_ready' }));
         console.log(`[Voice] Session started for ${client.username}`);
         if (client.webClientId && ctx.webClients.has(client.webClientId)) {
-          ctx.webClients.get(client.webClientId).inVoice = true;
-          ctx.broadcastAll({ type: 'voice_state', id: client.webClientId, username: client.username, inVoice: true });
+          const wc = ctx.webClients.get(client.webClientId);
+          wc.inVoice = true;
+          wc.voiceChannelId = voiceChId;
+          ctx.broadcastAll({ type: 'voice_state', id: client.webClientId, username: client.username, inVoice: true, voiceChannelId: voiceChId });
         }
       } catch (err) {
         console.error(`[Voice] Start error for ${client.username}:`, err.message);
         client.voicePeerId = null;
         ws.send(JSON.stringify({ type: 'error', message: 'Voice connection failed: ' + err.message }));
       }
+      break;
+    }
+
+    case 'voice_join_channel': {
+      if (!client.authenticated || !client.voicePeerId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Not in voice' }));
+        break;
+      }
+      const targetChId = msg.channelId;
+      if (targetChId === undefined || targetChId === null) break;
+      ctx.voiceBridge.moveToChannel(client.voicePeerId, targetChId);
+      if (client.webClientId && ctx.webClients.has(client.webClientId)) {
+        ctx.webClients.get(client.webClientId).voiceChannelId = targetChId;
+        ctx.broadcastAll({ type: 'voice_state', id: client.webClientId, username: client.username, inVoice: true, voiceChannelId: targetChId });
+      }
+      break;
+    }
+
+    case 'avatar_changed': {
+      if (!client.authenticated) break;
+      const avatarUrl = msg.avatarUrl || '/uploads/avatars/default.jpg';
+      if (client.webClientId && ctx.webClients.has(client.webClientId)) {
+        ctx.webClients.get(client.webClientId).avatarUrl = avatarUrl;
+      }
+      ctx.broadcastAll({
+        type: 'avatar_updated',
+        username: client.username,
+        avatarUrl,
+      });
       break;
     }
 
@@ -235,8 +313,10 @@ async function handleClientMessage(ws, msg, client, ctx) {
         client.voicePeerId = null;
       }
       if (client.webClientId && ctx.webClients.has(client.webClientId)) {
-        ctx.webClients.get(client.webClientId).inVoice = false;
-        ctx.broadcastAll({ type: 'voice_state', id: client.webClientId, username: client.username, inVoice: false });
+        const wc = ctx.webClients.get(client.webClientId);
+        wc.inVoice = false;
+        wc.voiceChannelId = null;
+        ctx.broadcastAll({ type: 'voice_state', id: client.webClientId, username: client.username, inVoice: false, voiceChannelId: null });
       }
       ws.send(JSON.stringify({ type: 'voice_stopped' }));
       break;

@@ -21,4 +21,5 @@ module.exports = {
   },
   botPrefix: process.env.BOT_COMMAND_PREFIX || '!',
   logLevel: process.env.LOG_LEVEL || 'info',
+  superUsers: (process.env.SUPERUSER_NAMES || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
 };

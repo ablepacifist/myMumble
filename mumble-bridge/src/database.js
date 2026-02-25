@@ -96,7 +96,49 @@ async function initBridgeDatabase() {
     )
   `);
 
+  // User profiles (avatar paths)
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS user_profiles (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      username VARCHAR(255) NOT NULL,
+      lexicon_user_id INT,
+      avatar_path VARCHAR(500) DEFAULT NULL,
+      display_name VARCHAR(255) DEFAULT NULL,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_username (username)
+    )
+  `);
+
   console.log('[DB] Bridge database tables initialized');
 }
 
-module.exports = { getMumblePool, getBridgePool, initBridgeDatabase };
+/**
+ * Get avatar path for a user.
+ */
+async function getAvatarPath(username) {
+  const pool = getBridgePool();
+  const [rows] = await pool.execute('SELECT avatar_path FROM user_profiles WHERE username = ?', [username]);
+  return rows.length > 0 ? rows[0].avatar_path : null;
+}
+
+/**
+ * Set avatar path for a user.
+ */
+async function setAvatarPath(username, avatarPath, lexiconUserId) {
+  const pool = getBridgePool();
+  await pool.execute(
+    `INSERT INTO user_profiles (username, lexicon_user_id, avatar_path) VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE avatar_path = VALUES(avatar_path), lexicon_user_id = COALESCE(VALUES(lexicon_user_id), lexicon_user_id)`,
+    [username, lexiconUserId || null, avatarPath]
+  );
+}
+
+/**
+ * Remove avatar for a user (set to null).
+ */
+async function removeAvatarPath(username) {
+  const pool = getBridgePool();
+  await pool.execute('UPDATE user_profiles SET avatar_path = NULL WHERE username = ?', [username]);
+}
+
+module.exports = { getMumblePool, getBridgePool, initBridgeDatabase, getAvatarPath, setAvatarPath, removeAvatarPath };
