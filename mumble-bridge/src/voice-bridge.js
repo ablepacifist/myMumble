@@ -256,20 +256,34 @@ class VoiceSession {
 
   /**
    * Handle incoming TCP data — standard Mumble framing.
+   * Uses offset tracking instead of Buffer.concat/slice to reduce GC pressure.
    */
   _onData(data) {
-    this.buffer = Buffer.concat([this.buffer, data]);
+    // Append incoming data
+    if (this.buffer.length === 0) {
+      this.buffer = data; // Zero-copy for common case
+    } else {
+      this.buffer = Buffer.concat([this.buffer, data]);
+    }
 
-    while (this.buffer.length >= 6) {
-      const typeId = this.buffer.readUInt16BE(0);
-      const length = this.buffer.readUInt32BE(2);
+    let offset = 0;
+    while (offset + 6 <= this.buffer.length) {
+      const typeId = this.buffer.readUInt16BE(offset);
+      const length = this.buffer.readUInt32BE(offset + 2);
 
-      if (this.buffer.length < 6 + length) break;
+      if (offset + 6 + length > this.buffer.length) break;
 
-      const payload = this.buffer.slice(6, 6 + length);
-      this.buffer = this.buffer.slice(6 + length);
+      const payload = this.buffer.subarray(offset + 6, offset + 6 + length);
+      offset += 6 + length;
 
       this._handleMessage(typeId, payload);
+    }
+
+    // Only allocate a new buffer if we consumed some data
+    if (offset > 0) {
+      this.buffer = offset < this.buffer.length
+        ? Buffer.from(this.buffer.subarray(offset)) // Copy remainder
+        : Buffer.alloc(0);
     }
   }
 
@@ -359,16 +373,23 @@ class VoiceSession {
     // Decode Opus to PCM using the sender-specific decoder
     let pcmBuffer;
     try {
-      const decoded = entry.decoder.decode(Buffer.from(opusData));
-      pcmBuffer = Buffer.from(decoded);
+      pcmBuffer = entry.decoder.decode(Buffer.from(opusData));
     } catch (err) {
       this._diag.decErr++;
       console.error(`[Voice][DIAG] Decode error for ${this.username} from sender ${senderSession}:`, err.message);
       return; // Skip bad frames
     }
 
-    // Send raw PCM to browser as binary WebSocket message
+    // Send raw PCM to browser as binary WebSocket message.
+    // Check backpressure: if the WebSocket's send buffer is backed up (> 5 frames
+    // worth of data queued), drop this frame to prevent ever-growing latency.
+    // This is critical when going through Cloudflare tunnel or slow connections.
     if (this.ws && this.ws.readyState === 1) {
+      const MAX_BUFFERED = 1920 * 5; // 5 frames × 1920 bytes = ~100ms
+      if (this.ws.bufferedAmount > MAX_BUFFERED) {
+        // Drop frame — better to skip than accumulate latency
+        return;
+      }
       try {
         this.ws.send(pcmBuffer, { binary: true });
         this._diag.pcmOut++;
@@ -417,8 +438,7 @@ class VoiceSession {
         );
 
         if (opusFrame && opusFrame.length > 0) {
-          const isLast = (offset + samplesPerFrame * 2 > int16.length);
-          this._sendOpusToMumble(opusFrame, isLast);
+          this._sendOpusToMumble(opusFrame);
           this._diag.opusOut++;
         }
       } catch (err) {
@@ -431,30 +451,26 @@ class VoiceSession {
   /**
    * Send an Opus frame to Mumble as UDPTunnel using legacy format.
    */
-  _sendOpusToMumble(opusFrame, isLastFrame = false) {
+  _sendOpusToMumble(opusFrame) {
     // Header byte: Opus (type=4, bits 7-5), target=0 (normal talking)
     const header = (4 << 5) | 0;
 
     const seqVarint = this._writeVarint(this.sequenceNumber++);
 
-    let sizeField = opusFrame.length & 0x1FFF;
-    if (isLastFrame) sizeField |= 0x2000;
-    const sizeVarint = this._writeVarint(sizeField);
+    // Size field: opus frame length only. Terminator bit (0x2000) is NOT
+    // set — the browser sends a continuous stream of frames, so we never
+    // signal end-of-speech mid-stream. The stream ends naturally when
+    // frames stop arriving (user mutes or disconnects).
+    const sizeVarint = this._writeVarint(opusFrame.length & 0x1FFF);
 
-    const audioPacket = Buffer.concat([
-      Buffer.from([header]),
-      seqVarint,
-      sizeVarint,
-      opusFrame,
-    ]);
-
-    // Wrap as UDPTunnel (type=1) with Mumble framing
+    // Build complete Mumble-framed UDPTunnel packet in one concat
+    const audioLen = 1 + seqVarint.length + sizeVarint.length + opusFrame.length;
     const tcpHeader = Buffer.alloc(6);
     tcpHeader.writeUInt16BE(MSG_TYPE.UDPTunnel, 0);
-    tcpHeader.writeUInt32BE(audioPacket.length, 2);
+    tcpHeader.writeUInt32BE(audioLen, 2);
 
     if (this.socket) {
-      this.socket.write(Buffer.concat([tcpHeader, audioPacket]));
+      this.socket.write(Buffer.concat([tcpHeader, Buffer.from([header]), seqVarint, sizeVarint, opusFrame]));
     }
   }
 

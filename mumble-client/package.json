@@ -1,0 +1,48 @@
+{
+  "name": "mumble-client",
+  "version": "1.0.0",
+  "description": "Discord-like Mumble desktop client",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "mocha tests/**/*.test.js --timeout 15000 --exit",
+    "package-win": "electron-builder --win --x64",
+    "package-linux": "electron-builder --linux --x64",
+    "package-all": "electron-builder --win --linux --x64"
+  },
+  "build": {
+    "appId": "com.mumble.client",
+    "productName": "MumbleChat",
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "proto/**/*",
+      "node_modules/**/*"
+    ],
+    "win": {
+      "target": ["portable", "nsis"],
+      "icon": "src/renderer/assets/icon.png"
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "icon": "src/renderer/assets/icon.png",
+      "category": "Network"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false
+    }
+  },
+  "dependencies": {
+    "electron-store": "^8.1.0",
+    "opusscript": "^0.1.1",
+    "protobufjs": "^7.2.5"
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.1",
+    "mocha": "^10.2.0",
+    "chai": "^4.3.10"
+  }
+}

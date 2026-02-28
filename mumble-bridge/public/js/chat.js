@@ -1144,8 +1144,6 @@
       gainNode.connect(audioContext.destination);
 
       // Handle captured audio — zero-alloc ring buffer accumulation
-      const vadThreshold = voiceSettings.vadThreshold;
-      const inputVolumeScale = voiceSettings.inputVolume / 100;
       const FRAME_SIZE = 960;               // 20ms @ 48kHz
       const SEND_RING_SIZE = FRAME_SIZE * 6; // 6 frames of headroom
       const sendRing = new Int16Array(SEND_RING_SIZE);
@@ -1154,9 +1152,20 @@
       let sendRPos = 0;
       let sendBuffered = 0;
 
+      // VAD with hold timer — keep transmitting for a short time after speech
+      // stops to avoid clipping word endings (consonants are quiet).
+      // holdFrames counts down from VAD_HOLD_FRAMES each time we detect speech,
+      // and we keep sending until it reaches 0.
+      const VAD_HOLD_FRAMES = 15; // 15 × 20ms = 300ms tail after speech drops
+      let vadHoldCounter = 0;
+
       voiceWorklet.port.onmessage = (e) => {
         if (e.data.type === 'capture' && ws && ws.readyState === WebSocket.OPEN) {
           const incoming = e.data.samples;
+
+          // Read settings dynamically so slider changes take effect immediately
+          const inputVolumeScale = voiceSettings.inputVolume / 100;
+          const vadThreshold = voiceSettings.vadThreshold;
 
           // Apply input volume
           if (inputVolumeScale !== 1) {
@@ -1180,11 +1189,17 @@
             }
             sendBuffered -= FRAME_SIZE;
 
-            // VAD — skip silent frames
+            // VAD with hold — skip truly silent frames but keep tail after speech
             let sumSq = 0;
             for (let i = 0; i < FRAME_SIZE; i++) sumSq += sendFrame[i] * sendFrame[i];
             const rms = Math.sqrt(sumSq / FRAME_SIZE);
-            if (rms < vadThreshold) continue;
+            if (rms >= vadThreshold) {
+              vadHoldCounter = VAD_HOLD_FRAMES; // Reset hold timer on speech
+            } else if (vadHoldCounter > 0) {
+              vadHoldCounter--; // Still in hold period — send this frame
+            } else {
+              continue; // Truly silent — skip
+            }
 
             // Copy frame buffer for async WebSocket send
             ws.send(sendFrame.buffer.slice(0));
