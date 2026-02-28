@@ -38,7 +38,7 @@ class VoiceBridge {
     this.channels = 1;
     this.frameDuration = 20; // ms
     this.samplesPerFrame = (this.sampleRate * this.frameDuration) / 1000; // 960
-    this.diag = new DiagnosticsLogger('voice');
+    this.diag = new DiagnosticsLogger('voice', config.voiceDiagEnabled);
   }
 
   /**

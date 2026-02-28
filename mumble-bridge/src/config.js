@@ -21,5 +21,6 @@ module.exports = {
   },
   botPrefix: process.env.BOT_COMMAND_PREFIX || '!',
   logLevel: process.env.LOG_LEVEL || 'info',
+  voiceDiagEnabled: (process.env.VOICE_DIAG_ENABLED || 'false').toLowerCase() === 'true',
   superUsers: (process.env.SUPERUSER_NAMES || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
 };

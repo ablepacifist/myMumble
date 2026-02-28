@@ -13,8 +13,15 @@ const fs = require('fs');
 const path = require('path');
 
 class DiagnosticsLogger {
-  constructor(name) {
+  /**
+   * @param {string} name - Logger name (used for filename prefix)
+   * @param {boolean} [enabled=true] - If false, log() and metric() are no-ops.
+   *   Pass false to silence all per-frame diagnostic output.
+   *   Toggle via VOICE_DIAG_ENABLED in .env and restart the service.
+   */
+  constructor(name, enabled = true) {
     this.name = name;
+    this.enabled = enabled;
     this.logsDir = path.join(__dirname, '..', 'logs');
     
     // Ensure logs directory exists
@@ -26,6 +33,10 @@ class DiagnosticsLogger {
     this.buffer = []; // Buffer logs for batch writes
     this.writeInterval = setInterval(() => this.flush(), 1000); // Flush every 1s
     this.maxFileSize = 50 * 1024 * 1024; // Rotate at 50MB
+
+    if (!enabled) {
+      console.log(`[${name.toUpperCase()}] Diagnostics DISABLED (set VOICE_DIAG_ENABLED=true in .env to enable)`);
+    }
   }
 
   getDateString() {
@@ -42,6 +53,7 @@ class DiagnosticsLogger {
    * @param {object} data - Event payload
    */
   log(event, data = {}) {
+    if (!this.enabled) return;
     const now = new Date();
     const timestamp = now.toISOString();
     const entry = {
