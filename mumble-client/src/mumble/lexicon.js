@@ -68,6 +68,22 @@ class LexiconClient {
   }
 
   /**
+   * Get avatar URL for a user from the bridge's HTTP API.
+   * @param {string} username
+   * @param {string} bridgeBaseUrl — e.g. 'https://voice.alex-dyakin.com'
+   * @returns {Promise<string|null>} — avatar URL path or null
+   */
+  async getAvatar(username, bridgeBaseUrl) {
+    try {
+      const url = `${bridgeBaseUrl}/api/avatar/${encodeURIComponent(username)}`;
+      const result = await this._requestUrl('GET', url);
+      return result?.avatarUrl || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
    * Get message history for a channel.
    * @param {number} channelId
    * @param {number} limit
@@ -92,6 +108,48 @@ class LexiconClient {
 
   _post(path, body) {
     return this._request('POST', path, body);
+  }
+
+  /**
+   * Make an HTTP request to an arbitrary full URL.
+   * Used for cross-service calls (e.g. bridge avatar API).
+   */
+  _requestUrl(method, fullUrl, body) {
+    return new Promise((resolve, reject) => {
+      const url = new URL(fullUrl);
+      const mod = url.protocol === 'https:' ? https : http;
+      const opts = {
+        method,
+        hostname: url.hostname,
+        port: url.port,
+        path: url.pathname + url.search,
+        headers: {},
+        timeout: 5000,
+      };
+
+      if (body) {
+        const json = JSON.stringify(body);
+        opts.headers['Content-Type'] = 'application/json';
+        opts.headers['Content-Length'] = Buffer.byteLength(json);
+      }
+
+      const req = mod.request(opts, (res) => {
+        let data = '';
+        res.on('data', (chunk) => (data += chunk));
+        res.on('end', () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            try { resolve(JSON.parse(data)); } catch (_) { resolve(data); }
+          } else {
+            reject(new Error(`HTTP ${res.statusCode}`));
+          }
+        });
+      });
+
+      req.on('error', reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+      if (body) req.write(JSON.stringify(body));
+      req.end();
+    });
   }
 
   _request(method, urlPath, body) {

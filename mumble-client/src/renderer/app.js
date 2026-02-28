@@ -31,6 +31,38 @@
 
   const DEFAULT_AVATAR = 'assets/default.jpg';
 
+  // Avatar cache — username → resolved URL
+  const avatarUrlCache = new Map();
+  const avatarPendingFetches = new Set();
+
+  /**
+   * Get avatar URL for a user. Returns cached URL immediately,
+   * or DEFAULT_AVATAR while fetching asynchronously.
+   * When the real URL arrives, updates all matching <img> elements.
+   */
+  function getAvatarUrl(username) {
+    if (!username) return DEFAULT_AVATAR;
+    if (avatarUrlCache.has(username)) return avatarUrlCache.get(username);
+    if (avatarPendingFetches.has(username)) return DEFAULT_AVATAR;
+
+    // Fetch async and update DOM when ready
+    avatarPendingFetches.add(username);
+    window.mumble.getAvatar(username).then((url) => {
+      avatarPendingFetches.delete(username);
+      if (url) {
+        avatarUrlCache.set(username, url);
+        // Update all avatar images for this user
+        document.querySelectorAll(`img[data-avatar-user="${CSS.escape(username)}"]`).forEach((img) => {
+          img.src = url;
+        });
+      }
+    }).catch(() => {
+      avatarPendingFetches.delete(username);
+    });
+
+    return DEFAULT_AVATAR;
+  }
+
   // Voice settings
   let voiceSettings = loadVoiceSettings();
 
@@ -423,7 +455,8 @@
         voiceUsers.forEach((u) => {
           const vu = document.createElement('div');
           vu.className = 'voice-user';
-          vu.innerHTML = `<img class="avatar" src="${DEFAULT_AVATAR}" alt="" style="width:24px;height:24px;border-radius:50%"><span>${escapeHtml(u.name || 'Unknown')}</span>`;
+          const uName = u.name || 'Unknown';
+          vu.innerHTML = `<img class="avatar" data-avatar-user="${escapeHtml(uName)}" src="${getAvatarUrl(uName)}" alt="" style="width:24px;height:24px;border-radius:50%"><span>${escapeHtml(uName)}</span>`;
           userList.appendChild(vu);
         });
         container.appendChild(userList);
@@ -468,7 +501,7 @@
     const div = document.createElement('div');
     div.className = 'member-item' + (online ? ' online' : '');
     div.innerHTML = `
-      <img class="avatar avatar-sm" src="${DEFAULT_AVATAR}" alt="">
+      <img class="avatar avatar-sm" data-avatar-user="${escapeHtml(name)}" src="${getAvatarUrl(name)}" alt="">
       <div class="member-item-info">
         <div class="member-item-name">${escapeHtml(name)}</div>
         ${status ? `<div class="member-item-status">${escapeHtml(status)}</div>` : ''}
@@ -555,7 +588,7 @@
 
     if (showHeader) {
       div.innerHTML = `
-        <div class="message-avatar"><img class="avatar avatar-md" src="${DEFAULT_AVATAR}" alt=""></div>
+        <div class="message-avatar"><img class="avatar avatar-md" data-avatar-user="${escapeHtml(author)}" src="${getAvatarUrl(author)}" alt=""></div>
         <div class="message-body">
           <div class="message-header">
             <span class="message-author">${escapeHtml(author)}</span>

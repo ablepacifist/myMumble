@@ -17,6 +17,8 @@ contextBridge.exposeInMainWorld('mumble', {
   getHistory: (data) => ipcRenderer.invoke('mumble:get-history', data),
   getConfig: () => ipcRenderer.invoke('mumble:get-config'),
   setConfig: (config) => ipcRenderer.send('mumble:set-config', config),
+  getAvatar: (username) => ipcRenderer.invoke('mumble:get-avatar', username),
+  getVoiceDiag: () => ipcRenderer.invoke('mumble:get-voice-diag'),
 
   // ── Events (main → renderer) ──
   on: (channel, callback) => {
