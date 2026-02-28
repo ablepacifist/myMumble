@@ -27,8 +27,10 @@ class VoiceProcessor extends AudioWorkletProcessor {
 
     // ── Jitter buffer ──
     // Initial buffering: wait until we have this many samples before starting.
-    // 960 samples = 20ms = 1 Opus frame. We buffer 2 frames (40ms) initially.
-    this._jitterThreshold = 960 * 2; // 40ms — 2 Opus frames
+    // 960 samples = 20ms = 1 Opus frame. We buffer 3 frames (60ms) initially
+    // to absorb TCP batching — production logs show 12% of frames arrive in
+    // <2ms bursts due to Nagle's algorithm and TCP segment coalescing.
+    this._jitterThreshold = 960 * 3; // 60ms — 3 Opus frames
     this._playing = false;
 
     // Once playing, DON'T reset on brief gaps. Instead, output silence from

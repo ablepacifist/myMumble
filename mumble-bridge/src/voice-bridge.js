@@ -160,14 +160,43 @@ class VoiceSession {
     this.opusDecoders = new Map(); // senderSession -> { decoder, lastUsed }
     this._decoderCleanupInterval = setInterval(() => this._cleanupIdleDecoders(), 30000);
 
-    // ── Diagnostic counters (temporary) ──
-    this._diag = { pcmIn: 0, opusOut: 0, mumbleIn: 0, pcmOut: 0, encErr: 0, decErr: 0, wsErr: 0, echoSkip: 0 };
+    // ── Audio Mixer ──
+    // Mumble sends SEPARATE Opus streams per talking user — it does NOT mix.
+    // Without mixing, each sender's decoded PCM gets appended sequentially to
+    // the browser's playback buffer, causing speakers to alternate every 20ms
+    // instead of being heard simultaneously. This makes multi-user speech
+    // completely unintelligible.
+    //
+    // Solution: accumulate decoded PCM from ALL senders into a mixing buffer.
+    // Every 20ms, flush the mixed result to the browser as a single frame.
+    this._mixBuf = new Int16Array(bridge.samplesPerFrame);  // 960 samples
+    this._mixSources = 0;       // How many senders contributed to current mix
+    this._mixSenderSet = new Set(); // Which senders are in current mix window
+    this._mixDirty = false;
+    this._mixTimer = setInterval(() => this._flushMixBuffer(), bridge.frameDuration);
+    this._mixFramesSent = 0;    // Total mixed frames sent to browser
+
+    // ── Diagnostic counters ──
+    this._diag = { pcmIn: 0, opusOut: 0, mumbleIn: 0, pcmOut: 0, encErr: 0, decErr: 0, wsErr: 0, echoSkip: 0, mixFlush: 0, mixMulti: 0 };
+    // Accumulated totals that survive periodic resets — used in session_final_stats
+    this._diagTotals = { pcmIn: 0, opusOut: 0, mumbleIn: 0, pcmOut: 0, encErr: 0, decErr: 0, wsErr: 0, echoSkip: 0, mixFlush: 0, mixMulti: 0 };
+    // Frame drop tracking (must be initialized before any audio processing)
+    this._frameDrops = { droppedByBuffering: 0, droppedByError: 0 };
     this._diagInterval = setInterval(() => {
       const d = this._diag;
-      if (d.pcmIn || d.mumbleIn) {
-        console.log(`[Voice][DIAG] ${this.username}: pcmIn=${d.pcmIn} opusOut=${d.opusOut} mumbleIn=${d.mumbleIn} pcmOut=${d.pcmOut} echoSkip=${d.echoSkip} encErr=${d.encErr} decErr=${d.decErr} wsErr=${d.wsErr}`);
+      if (d.pcmIn || d.mumbleIn || d.mixFlush) {
+        console.log(`[Voice][DIAG] ${this.username}: pcmIn=${d.pcmIn} opusOut=${d.opusOut} mumbleIn=${d.mumbleIn} pcmOut=${d.pcmOut} mixFlush=${d.mixFlush} mixMulti=${d.mixMulti} echoSkip=${d.echoSkip} encErr=${d.encErr} decErr=${d.decErr} wsErr=${d.wsErr}`);
+        this.bridge.diag.log('diag_interval', {
+          username: this.username,
+          ...d,
+          activeSenders: this.opusDecoders.size,
+        });
       }
-      this._diag = { pcmIn: 0, opusOut: 0, mumbleIn: 0, pcmOut: 0, encErr: 0, decErr: 0, wsErr: 0, echoSkip: 0 };
+      // Accumulate into totals before resetting
+      for (const key of Object.keys(d)) {
+        this._diagTotals[key] = (this._diagTotals[key] || 0) + d[key];
+      }
+      this._diag = { pcmIn: 0, opusOut: 0, mumbleIn: 0, pcmOut: 0, encErr: 0, decErr: 0, wsErr: 0, echoSkip: 0, mixFlush: 0, mixMulti: 0 };
     }, 5000);
   }
 
@@ -224,6 +253,11 @@ class VoiceSession {
           rejectUnauthorized: false,
         },
         () => {
+          // Disable Nagle's algorithm — send Opus packets immediately instead
+          // of batching them. Without this, TCP waits up to 200ms to batch
+          // small writes, causing burst delivery and audio jitter.
+          this.socket.setNoDelay(true);
+
           // Send Version — use 1.2.4 so server uses legacy audio format.
           // Mumble 1.5+ introduced protobuf audio framing; we implement legacy.
           this._sendProto('Version', {
@@ -340,9 +374,11 @@ class VoiceSession {
   }
 
   /**
-   * Receive audio from Mumble, decode Opus → PCM, send to browser via WebSocket binary.
+   * Receive audio from Mumble, decode Opus → PCM, mix into output buffer.
    * Mumble sends SEPARATE Opus streams per talking user, so we need a
    * dedicated decoder for each sender to maintain correct Opus state.
+   * Decoded PCM is mixed additively into _mixBuf; _flushMixBuffer sends
+   * the combined result to the browser every 20ms.
    */
   _onMumbleAudio(payload) {
     if (payload.length < 2) return;
@@ -364,7 +400,6 @@ class VoiceSession {
     // Never play back our own audio — prevents echo feedback loop
     if (senderSession === this.mumbleSession) {
       this._diag.echoSkip++;
-      this.bridge.diag.metric('echo_skip', 1, { username: this.username, senderSession });
       return;
     }
 
@@ -397,53 +432,107 @@ class VoiceSession {
       return; // Skip bad frames
     }
 
-    // Send raw PCM to browser as binary WebSocket message.
-    // Check backpressure: if the WebSocket's send buffer is backed up, drop this frame
-    // to prevent ever-growing latency. This is critical when going through Cloudflare
-    // tunnel or slow connections.
+    // Mix decoded PCM into the output buffer (additive mixing with clamping).
+    // This is the critical fix: instead of sending each sender's PCM as a
+    // separate WS message (which causes them to play sequentially / interleaved),
+    // we ADD all senders' samples together so they play simultaneously.
+    this._mixIntoBuffer(pcmBuffer, senderSession);
+  }
+
+  /**
+   * Additively mix decoded PCM samples into the mix buffer.
+   * @param {Buffer} pcmBuffer - Int16LE PCM from Opus decode (960 samples = 1920 bytes)
+   * @param {number} senderSession - Mumble session ID of the audio source
+   */
+  _mixIntoBuffer(pcmBuffer, senderSession) {
+    const int16 = new Int16Array(
+      pcmBuffer.buffer, pcmBuffer.byteOffset, pcmBuffer.byteLength / 2
+    );
+    const len = Math.min(int16.length, this._mixBuf.length);
+
+    for (let i = 0; i < len; i++) {
+      // Additive mix: sum samples, clamp to Int16 range
+      const sum = this._mixBuf[i] + int16[i];
+      this._mixBuf[i] = sum > 32767 ? 32767 : sum < -32768 ? -32768 : sum;
+    }
+
+    this._mixSenderSet.add(senderSession);
+    this._mixSources = this._mixSenderSet.size;
+    this._mixDirty = true;
+  }
+
+  /**
+   * Flush the mixed audio buffer to the browser.
+   * Called every 20ms by _mixTimer. Sends one combined PCM frame containing
+   * the additive mix of all senders who contributed during this window.
+   */
+  _flushMixBuffer() {
+    if (!this._mixDirty) return;
+
     if (this.ws && this.ws.readyState === 1) {
       const MAX_BUFFERED = 1920 * 5; // 5 frames × 1920 bytes = ~100ms
-      
-      // Log WebSocket buffer state for diagnostics
+
       this.bridge.diag.metric('ws_buffer_amount', this.ws.bufferedAmount, { username: this.username });
-      
+
       if (this.ws.bufferedAmount > MAX_BUFFERED) {
-        // Frame dropped due to WebSocket backpressure
         this._diag.wsErr++;
         this._frameDrops.droppedByBuffering++;
         this.bridge.diag.log('frame_drop_buffering', {
           username: this.username,
           bufferedAmount: this.ws.bufferedAmount,
           maxAllowed: MAX_BUFFERED,
-          ratioOverThreshold: (this.ws.bufferedAmount / MAX_BUFFERED).toFixed(2),
-          senderSession,
+          mixSources: this._mixSources,
         });
-        return; // Drop frame to prevent latency buildup
-      }
+      } else {
+        try {
+          // Send the mixed buffer as Int16LE binary
+          const outBuf = Buffer.from(
+            this._mixBuf.buffer, this._mixBuf.byteOffset, this._mixBuf.byteLength
+          );
+          // Must copy — _mixBuf gets cleared immediately after
+          this.ws.send(Buffer.from(outBuf), { binary: true });
+          this._diag.pcmOut++;
+          this._diag.mixFlush++;
 
-      try {
-        this.ws.send(pcmBuffer, { binary: true });
-        this._diag.pcmOut++;
-      } catch (err) {
-        this._diag.wsErr++;
-        this._frameDrops.droppedByError++;
-        console.error(`[Voice][DIAG] WS send error for ${this.username}:`, err.message);
-        this.bridge.diag.log('ws_send_error', {
-          username: this.username,
-          error: err.message,
-          readyState: this.ws.readyState,
-        });
+          // Track multi-sender mix events for diagnostics
+          if (this._mixSources > 1) {
+            this._diag.mixMulti++;
+            this.bridge.diag.log('mix_multi_source', {
+              username: this.username,
+              sources: this._mixSources,
+              senders: Array.from(this._mixSenderSet),
+            });
+          }
+        } catch (err) {
+          this._diag.wsErr++;
+          this._frameDrops.droppedByError++;
+          console.error(`[Voice][DIAG] WS send error for ${this.username}:`, err.message);
+          this.bridge.diag.log('ws_send_error', {
+            username: this.username,
+            error: err.message,
+            readyState: this.ws.readyState,
+          });
+        }
       }
     }
+
+    // Reset mix buffer for next window
+    this._mixBuf.fill(0);
+    this._mixSenderSet.clear();
+    this._mixSources = 0;
+    this._mixDirty = false;
   }
 
   /**
-   * Clean up decoders for senders who stopped talking (idle > 10s).
+   * Clean up decoders for senders who stopped talking (idle > 60s).
+   * Increased from 10s to 60s to reduce decoder recreation frequency.
+   * Opus decoders are cheap in memory but creating new ones mid-conversation
+   * means the first frame decoded has no prior state context.
    */
   _cleanupIdleDecoders() {
     const now = Date.now();
     for (const [session, entry] of this.opusDecoders) {
-      if (now - entry.lastUsed > 10000) {
+      if (now - entry.lastUsed > 60000) {
         try { entry.decoder.delete(); } catch (_) {}
         this.opusDecoders.delete(session);
       }
@@ -653,6 +742,10 @@ class VoiceSession {
       clearInterval(this._diagInterval);
       this._diagInterval = null;
     }
+    if (this._mixTimer) {
+      clearInterval(this._mixTimer);
+      this._mixTimer = null;
+    }
     if (this._decoderCleanupInterval) {
       clearInterval(this._decoderCleanupInterval);
       this._decoderCleanupInterval = null;
@@ -671,23 +764,26 @@ class VoiceSession {
       this.socket = null;
     }
 
-    // Final diagnostic report
+    // Final diagnostic report — merge current interval into totals
+    for (const key of Object.keys(this._diag)) {
+      this._diagTotals[key] += this._diag[key];
+    }
     this.bridge.diag.log('session_final_stats', {
       username: this.username,
       peerId: this.peerId,
       totalFramesProcessed: {
-        pcmIn: this._diag.pcmIn,
-        opusOut: this._diag.opusOut,
-        mumbleIn: this._diag.mumbleIn,
-        pcmOut: this._diag.pcmOut,
+        pcmIn: this._diagTotals.pcmIn,
+        opusOut: this._diagTotals.opusOut,
+        mumbleIn: this._diagTotals.mumbleIn,
+        pcmOut: this._diagTotals.pcmOut,
       },
       errors: {
-        encErr: this._diag.encErr,
-        decErr: this._diag.decErr,
-        wsErr: this._diag.wsErr,
+        encErr: this._diagTotals.encErr,
+        decErr: this._diagTotals.decErr,
+        wsErr: this._diagTotals.wsErr,
       },
       frameDrops: this._frameDrops,
-      echoSkipped: this._diag.echoSkip,
+      echoSkipped: this._diagTotals.echoSkip,
     });
   }
 }
