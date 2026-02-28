@@ -4,7 +4,7 @@
   "description": "Discord-like Mumble desktop client",
   "main": "main.js",
   "scripts": {
-    "start": "electron .",
+    "start": "electron . --no-sandbox",
     "test": "mocha tests/**/*.test.js --timeout 15000 --exit",
     "package-win": "electron-builder --win --x64",
     "package-linux": "electron-builder --linux --x64",

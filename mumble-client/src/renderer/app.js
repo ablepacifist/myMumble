@@ -7,6 +7,14 @@
 (function () {
   'use strict';
 
+  window.addEventListener('error', (event) => {
+    console.error('[Renderer] Uncaught error:', event.error || event.message);
+  });
+
+  window.addEventListener('unhandledrejection', (event) => {
+    console.error('[Renderer] Unhandled promise rejection:', event.reason);
+  });
+
   // ── State ──
   let username = '';
   let userId = null;
@@ -610,27 +618,49 @@
   let isDeafened = false;
   let gainNode = null;
 
+  async function getMicStreamWithFallback() {
+    const preferredConstraints = {
+      audio: {
+        echoCancellation: voiceSettings.echoCancellation,
+        noiseSuppression: voiceSettings.noiseSuppression,
+        autoGainControl: voiceSettings.autoGainControl,
+        sampleRate: 48000,
+        channelCount: 1,
+      },
+      video: false,
+    };
+
+    if (voiceSettings.inputDeviceId && voiceSettings.inputDeviceId !== 'default') {
+      preferredConstraints.audio.deviceId = { exact: voiceSettings.inputDeviceId };
+    }
+
+    try {
+      return await navigator.mediaDevices.getUserMedia(preferredConstraints);
+    } catch (err) {
+      // Common case: saved deviceId no longer exists or strict constraints unsupported.
+      if (err && (err.name === 'NotFoundError' || err.name === 'OverconstrainedError')) {
+        voiceSettings.inputDeviceId = 'default';
+        saveVoiceSettings();
+        return navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: voiceSettings.echoCancellation,
+            noiseSuppression: voiceSettings.noiseSuppression,
+            autoGainControl: voiceSettings.autoGainControl,
+          },
+          video: false,
+        });
+      }
+      throw err;
+    }
+  }
+
   async function startVoice(voiceChannelId) {
     if (voiceActive) return;
 
     try {
       addSystemMessage('🎤 Requesting microphone access...');
 
-      const constraints = {
-        audio: {
-          echoCancellation: voiceSettings.echoCancellation,
-          noiseSuppression: voiceSettings.noiseSuppression,
-          autoGainControl: voiceSettings.autoGainControl,
-          sampleRate: 48000,
-          channelCount: 1,
-        },
-        video: false,
-      };
-      if (voiceSettings.inputDeviceId && voiceSettings.inputDeviceId !== 'default') {
-        constraints.audio.deviceId = { exact: voiceSettings.inputDeviceId };
-      }
-
-      micStream = await navigator.mediaDevices.getUserMedia(constraints);
+      micStream = await getMicStreamWithFallback();
       addSystemMessage('🎤 Connecting to voice...');
 
       audioContext = new AudioContext({ sampleRate: 48000 });
@@ -708,6 +738,7 @@
       let errorMsg = err.message || 'Unknown error';
       if (err.name === 'NotAllowedError') errorMsg = 'Microphone permission denied.';
       else if (err.name === 'NotFoundError') errorMsg = 'No microphone found.';
+      else if (err.name === 'OverconstrainedError') errorMsg = 'Selected microphone is unavailable.';
       addSystemMessage('🎤 Voice error: ' + errorMsg);
       stopVoice();
     }
@@ -833,6 +864,20 @@
   async function populateAudioDevices() {
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
+      const inputDevices = devices.filter((d) => d.kind === 'audioinput');
+      const outputDevices = devices.filter((d) => d.kind === 'audiooutput');
+
+      const inputIds = new Set(inputDevices.map((d) => d.deviceId));
+      const outputIds = new Set(outputDevices.map((d) => d.deviceId));
+
+      if (voiceSettings.inputDeviceId !== 'default' && !inputIds.has(voiceSettings.inputDeviceId)) {
+        voiceSettings.inputDeviceId = 'default';
+      }
+      if (voiceSettings.outputDeviceId !== 'default' && !outputIds.has(voiceSettings.outputDeviceId)) {
+        voiceSettings.outputDeviceId = 'default';
+      }
+      saveVoiceSettings();
+
       voiceInputDevice.innerHTML = '<option value="default">Default</option>';
       voiceOutputDevice.innerHTML = '<option value="default">Default</option>';
       devices.forEach((d) => {
@@ -882,9 +927,7 @@
 
   function startVoiceTest() {
     stopVoiceTest();
-    navigator.mediaDevices.getUserMedia({
-      audio: { deviceId: voiceSettings.inputDeviceId !== 'default' ? { exact: voiceSettings.inputDeviceId } : undefined },
-    }).then((stream) => {
+    getMicStreamWithFallback().then((stream) => {
       testStream = stream;
       testContext = new AudioContext();
       testAnalyser = testContext.createAnalyser();
@@ -903,7 +946,10 @@
       }
       tick();
       voiceTestBtn.textContent = 'Stop Test';
-    }).catch((e) => console.error('[VoiceTest]', e));
+    }).catch((e) => {
+      console.error('[VoiceTest]', e);
+      addSystemMessage('🎤 Voice test failed: ' + (e.message || e.name || 'Unknown error'));
+    });
   }
 
   function stopVoiceTest() {

@@ -51,3 +51,9 @@ compile_commands.json
 __pycache__/
 CMakeSettings.json
 CLAUDE.md
+
+# Node/Electron artifacts
+node_modules/
+**/node_modules/
+mumble-client/dist/
+*.log

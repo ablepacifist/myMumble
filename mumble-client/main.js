@@ -8,8 +8,13 @@
  *   Renderer mic → IPC → Opus encode → Mumble UDPTunnel
  *   Mumble UDPTunnel → Opus decode → mixer → IPC → Renderer speakers
  */
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
+
+// Linux sandbox workaround — avoids needing SUID chrome-sandbox
+app.commandLine.appendSwitch('no-sandbox');
+app.disableHardwareAcceleration();
+app.commandLine.appendSwitch('disable-gpu');
 const Store = require('electron-store');
 const MumbleConnection = require('./src/mumble/connection');
 const LexiconClient = require('./src/mumble/lexicon');
@@ -56,6 +61,16 @@ function createWindow() {
 
   mainWindow.once('ready-to-show', () => mainWindow.show());
 
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    console.error('[Renderer] Process gone:', details);
+    dialog.showErrorBox('MumbleChat', `Renderer crashed (${details.reason || 'unknown'}). Restarting window...`);
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      createWindow();
+    } else {
+      mainWindow.reload();
+    }
+  });
+
   mainWindow.on('resize', () => {
     const [w, h] = mainWindow.getSize();
     store.set('windowWidth', w);
@@ -71,6 +86,15 @@ function createWindow() {
     stopMixer();
   });
 }
+
+process.on('uncaughtException', (err) => {
+  console.error('[Main] uncaughtException:', err);
+  dialog.showErrorBox('MumbleChat', `Main process error:\n${err?.stack || err?.message || String(err)}`);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[Main] unhandledRejection:', reason);
+});
 
 app.whenReady().then(createWindow);
 app.on('window-all-closed', () => {
