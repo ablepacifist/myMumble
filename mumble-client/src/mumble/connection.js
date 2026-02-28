@@ -36,6 +36,7 @@ class MumbleConnection extends EventEmitter {
     this.socket = null;
     this.ready = false;
     this.session = null;
+    this._tcpBuf = Buffer.alloc(0);
     this.channels = new Map();
     this.users = new Map();
     this.pingInterval = null;
@@ -87,6 +88,11 @@ class MumbleConnection extends EventEmitter {
           rejectUnauthorized: false,
         },
         () => {
+          // Disable Nagle's algorithm — send Opus packets immediately
+          // instead of batching them. Without this, TCP waits up to 200ms
+          // to batch small writes, causing burst delivery and audio jitter.
+          this.socket.setNoDelay(true);
+
           // Send Version — use 1.2.4 so server uses legacy audio format
           this._send('Version', {
             versionV1: (1 << 16) | (2 << 8) | 4,
@@ -128,9 +134,28 @@ class MumbleConnection extends EventEmitter {
   // ── Incoming Data ──
 
   _onData(data) {
-    const messages = this.protocol.parseMessages(data);
-    for (const msg of messages) {
-      this._handleMessage(msg.type, msg.payload);
+    // Use offset-based parsing to reduce GC pressure from repeated
+    // Buffer.concat/slice on the hot audio path.
+    if (this._tcpBuf.length === 0) {
+      this._tcpBuf = data; // Zero-copy for common case
+    } else {
+      this._tcpBuf = Buffer.concat([this._tcpBuf, data]);
+    }
+
+    let offset = 0;
+    while (offset + 6 <= this._tcpBuf.length) {
+      const type = this._tcpBuf.readUInt16BE(offset);
+      const length = this._tcpBuf.readUInt32BE(offset + 2);
+      if (offset + 6 + length > this._tcpBuf.length) break;
+      const payload = this._tcpBuf.subarray(offset + 6, offset + 6 + length);
+      offset += 6 + length;
+      this._handleMessage(type, payload);
+    }
+
+    if (offset > 0) {
+      this._tcpBuf = offset < this._tcpBuf.length
+        ? Buffer.from(this._tcpBuf.subarray(offset))
+        : Buffer.alloc(0);
     }
   }
 

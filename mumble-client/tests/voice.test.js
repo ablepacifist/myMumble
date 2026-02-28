@@ -270,8 +270,8 @@ describe('Voice (Opus + Mixer)', () => {
 
       expect(voice.decoderCount).to.be.greaterThan(0);
 
-      // Force the lastUsed timestamp to the past
-      voice._forceDecoderAge('idle_test_sender', 15000);
+      // Force the lastUsed timestamp to the past (beyond 60s idle timeout)
+      voice._forceDecoderAge('idle_test_sender', 65000);
       voice.cleanupIdleDecoders();
 
       // The idle decoder should be gone

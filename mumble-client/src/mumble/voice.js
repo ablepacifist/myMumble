@@ -181,9 +181,10 @@ class Voice {
 
   /**
    * Remove decoders that have been idle for longer than maxIdleMs.
-   * @param {number} maxIdleMs — default 10000 (10 seconds)
+   * Increased to 60s to avoid destroying Opus state mid-conversation.
+   * @param {number} maxIdleMs — default 60000 (60 seconds)
    */
-  cleanupIdleDecoders(maxIdleMs = 10000) {
+  cleanupIdleDecoders(maxIdleMs = 60000) {
     const now = Date.now();
     for (const [id, entry] of this.decoders) {
       if (now - entry.lastUsed > maxIdleMs) {

@@ -27,8 +27,14 @@ let lexicon = null;
 let currentUser = null; // { id, username, displayName }
 
 // ── Audio Mixer State ──
-const senderQueues = new Map(); // senderSession → Int16Array[]
+// Accumulator-based mixer (matches the bridge's proven approach).
+// All decoded PCM is additively mixed into a single 960-sample buffer.
+// Every 20ms the buffer is flushed to the renderer and reset to zero.
+const MIX_FRAME = 960;
+let mixBuf = new Int16Array(MIX_FRAME);
+let mixDirty = false;
 let mixerInterval = null;
+let decoderCleanupInterval = null;
 
 // ── Default Config ──
 const DEFAULT_CONFIG = {
@@ -166,15 +172,18 @@ ipcMain.handle('mumble:connect', async (_event, { host, port, username }) => {
     stopMixer();
   });
 
-  // Audio from Mumble → queue for mixer
+  // Audio from Mumble → mix into accumulator buffer immediately.
+  // This is the critical fix from the bridge: instead of queuing frames
+  // per-sender and popping one per tick (which falls behind on bursts),
+  // we additively mix ALL incoming PCM into a single buffer that gets
+  // flushed every 20ms.
   mumble.on('audio', ({ senderSession, pcm }) => {
-    if (!senderQueues.has(senderSession)) {
-      senderQueues.set(senderSession, []);
+    const len = Math.min(pcm.length, MIX_FRAME);
+    for (let i = 0; i < len; i++) {
+      const sum = mixBuf[i] + pcm[i];
+      mixBuf[i] = sum > 32767 ? 32767 : sum < -32768 ? -32768 : sum;
     }
-    const queue = senderQueues.get(senderSession);
-    queue.push(pcm);
-    // Cap at 10 frames (200ms) to prevent memory buildup
-    while (queue.length > 10) queue.shift();
+    mixDirty = true;
   });
 
   try {
@@ -280,34 +289,26 @@ ipcMain.on('mumble:set-config', (_event, config) => {
 
 function startMixer() {
   stopMixer();
+
+  // Flush the mix buffer every 20ms (one Opus frame duration).
+  // Only sends if at least one sender contributed audio this window.
   mixerInterval = setInterval(() => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (!mixDirty) return;
 
-    const frames = [];
-    for (const [session, queue] of senderQueues) {
-      if (queue.length > 0) {
-        frames.push(queue.shift());
-      }
-    }
+    // Copy the buffer before sending (it gets cleared immediately)
+    const out = Buffer.from(mixBuf.buffer, mixBuf.byteOffset, mixBuf.byteLength);
+    send('mumble:audio-data', Buffer.from(out));
 
-    // Remove stale senders (no frames for 5+ ticks = 100ms+)
-    // Actually, just leave them — they cost nothing when empty
+    // Reset for next 20ms window
+    mixBuf.fill(0);
+    mixDirty = false;
+  }, 20);
 
-    if (frames.length === 0) return;
-
-    // Mix all frames into one
-    const mixed = new Int16Array(960);
-    for (let i = 0; i < 960; i++) {
-      let sum = 0;
-      for (const frame of frames) {
-        if (i < frame.length) sum += frame[i];
-      }
-      mixed[i] = Math.max(-32768, Math.min(32767, sum));
-    }
-
-    // Send mixed PCM to renderer
-    send('mumble:audio-data', Buffer.from(mixed.buffer));
-  }, 20); // 20ms = one Opus frame duration
+  // Clean up idle Opus decoders every 30s (60s idle timeout)
+  decoderCleanupInterval = setInterval(() => {
+    if (mumble && mumble.voice) mumble.voice.cleanupIdleDecoders(60000);
+  }, 30000);
 }
 
 function stopMixer() {
@@ -315,7 +316,12 @@ function stopMixer() {
     clearInterval(mixerInterval);
     mixerInterval = null;
   }
-  senderQueues.clear();
+  if (decoderCleanupInterval) {
+    clearInterval(decoderCleanupInterval);
+    decoderCleanupInterval = null;
+  }
+  mixBuf.fill(0);
+  mixDirty = false;
 }
 
 // ── Helpers ──
