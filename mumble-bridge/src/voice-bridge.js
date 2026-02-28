@@ -14,6 +14,7 @@ const path = require('path');
 const protobuf = require('protobufjs');
 const OpusScript = require('opusscript');
 const config = require('./config');
+const DiagnosticsLogger = require('./diagnostics');
 
 // Mumble message type IDs we need
 const MSG_TYPE = {
@@ -37,6 +38,7 @@ class VoiceBridge {
     this.channels = 1;
     this.frameDuration = 20; // ms
     this.samplesPerFrame = (this.sampleRate * this.frameDuration) / 1000; // 960
+    this.diag = new DiagnosticsLogger('voice');
   }
 
   /**
@@ -75,9 +77,11 @@ class VoiceBridge {
     try {
       await session.connect();
       console.log(`[Voice] Session started for ${username} (${peerId}), ${this.sessions.size} active`);
+      this.diag.log('session_started', { username, peerId, activeSessions: this.sessions.size });
       return session;
     } catch (err) {
       this.sessions.delete(peerId);
+      this.diag.log('session_start_error', { username, peerId, error: err.message });
       throw err;
     }
   }
@@ -88,6 +92,11 @@ class VoiceBridge {
   stopSession(peerId) {
     const session = this.sessions.get(peerId);
     if (session) {
+      this.diag.log('session_stopping', {
+        username: session.username,
+        peerId,
+        stats: session._diag
+      });
       session.disconnect();
       this.sessions.delete(peerId);
       console.log(`[Voice] Session stopped for ${session.username} (${peerId}), ${this.sessions.size} active`);
@@ -355,6 +364,7 @@ class VoiceSession {
     // Never play back our own audio — prevents echo feedback loop
     if (senderSession === this.mumbleSession) {
       this._diag.echoSkip++;
+      this.bridge.diag.metric('echo_skip', 1, { username: this.username, senderSession });
       return;
     }
 
@@ -367,6 +377,7 @@ class VoiceSession {
       };
       this.opusDecoders.set(senderSession, entry);
       console.log(`[Voice][DIAG] ${this.username}: new decoder for sender session ${senderSession}`);
+      this.bridge.diag.log('decoder_created', { username: this.username, senderSession });
     }
     entry.lastUsed = Date.now();
 
@@ -377,25 +388,51 @@ class VoiceSession {
     } catch (err) {
       this._diag.decErr++;
       console.error(`[Voice][DIAG] Decode error for ${this.username} from sender ${senderSession}:`, err.message);
+      this.bridge.diag.log('decode_error', {
+        username: this.username,
+        senderSession,
+        error: err.message,
+        opusDataLength: opusData.length,
+      });
       return; // Skip bad frames
     }
 
     // Send raw PCM to browser as binary WebSocket message.
-    // Check backpressure: if the WebSocket's send buffer is backed up (> 5 frames
-    // worth of data queued), drop this frame to prevent ever-growing latency.
-    // This is critical when going through Cloudflare tunnel or slow connections.
+    // Check backpressure: if the WebSocket's send buffer is backed up, drop this frame
+    // to prevent ever-growing latency. This is critical when going through Cloudflare
+    // tunnel or slow connections.
     if (this.ws && this.ws.readyState === 1) {
       const MAX_BUFFERED = 1920 * 5; // 5 frames × 1920 bytes = ~100ms
+      
+      // Log WebSocket buffer state for diagnostics
+      this.bridge.diag.metric('ws_buffer_amount', this.ws.bufferedAmount, { username: this.username });
+      
       if (this.ws.bufferedAmount > MAX_BUFFERED) {
-        // Drop frame — better to skip than accumulate latency
-        return;
+        // Frame dropped due to WebSocket backpressure
+        this._diag.wsErr++;
+        this._frameDrops.droppedByBuffering++;
+        this.bridge.diag.log('frame_drop_buffering', {
+          username: this.username,
+          bufferedAmount: this.ws.bufferedAmount,
+          maxAllowed: MAX_BUFFERED,
+          ratioOverThreshold: (this.ws.bufferedAmount / MAX_BUFFERED).toFixed(2),
+          senderSession,
+        });
+        return; // Drop frame to prevent latency buildup
       }
+
       try {
         this.ws.send(pcmBuffer, { binary: true });
         this._diag.pcmOut++;
       } catch (err) {
         this._diag.wsErr++;
+        this._frameDrops.droppedByError++;
         console.error(`[Voice][DIAG] WS send error for ${this.username}:`, err.message);
+        this.bridge.diag.log('ws_send_error', {
+          username: this.username,
+          error: err.message,
+          readyState: this.ws.readyState,
+        });
       }
     }
   }
@@ -440,10 +477,17 @@ class VoiceSession {
         if (opusFrame && opusFrame.length > 0) {
           this._sendOpusToMumble(opusFrame);
           this._diag.opusOut++;
+          this.bridge.diag.metric('opus_frame_size', opusFrame.length, { username: this.username });
         }
       } catch (err) {
         this._diag.encErr++;
+        this._frameDrops.droppedByError++;
         console.error(`[Voice][DIAG] Encode error for ${this.username}:`, err.message);
+        this.bridge.diag.log('encode_error', {
+          username: this.username,
+          error: err.message,
+          frameSamples: samplesPerFrame,
+        });
       }
     }
   }
@@ -626,7 +670,27 @@ class VoiceSession {
       try { this.socket.destroy(); } catch (e) {}
       this.socket = null;
     }
+
+    // Final diagnostic report
+    this.bridge.diag.log('session_final_stats', {
+      username: this.username,
+      peerId: this.peerId,
+      totalFramesProcessed: {
+        pcmIn: this._diag.pcmIn,
+        opusOut: this._diag.opusOut,
+        mumbleIn: this._diag.mumbleIn,
+        pcmOut: this._diag.pcmOut,
+      },
+      errors: {
+        encErr: this._diag.encErr,
+        decErr: this._diag.decErr,
+        wsErr: this._diag.wsErr,
+      },
+      frameDrops: this._frameDrops,
+      echoSkipped: this._diag.echoSkip,
+    });
   }
 }
 
 module.exports = VoiceBridge;
+module.exports.voiceBridgeInstance = null; // Set by index.js

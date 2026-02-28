@@ -1,5 +1,5 @@
 /**
- * HTTP static file server + Avatar API.
+ * HTTP static file server + Avatar API + Diagnostics API.
  * Serves the public/ directory with cache busting.
  */
 const http = require('http');
@@ -73,6 +73,71 @@ function createHttpServer(publicDir) {
     // POST /api/avatar/remove
     if (req.method === 'POST' && urlPath === '/api/avatar/remove') {
       handleAvatarRemove(req, res);
+      return;
+    }
+
+    // ── Diagnostics API (admin only, for testing) ─────────
+    // GET /api/diag/logs — Get latest voice diagnostics
+    if (req.method === 'GET' && urlPath.startsWith('/api/diag/logs')) {
+      const lines = parseInt(req.url.split('lines=')[1] || '500');
+      try {
+        const VoiceBridge = require('./voice-bridge');
+        const voiceDiag = VoiceBridge.voiceBridgeInstance?.diag;
+        if (!voiceDiag) {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Voice bridge not initialized' }));
+          return;
+        }
+        const logContent = voiceDiag.getTailLogs(Math.min(lines, 5000));
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end(logContent);
+      } catch (e) {
+        console.error('[Diag API] Error:', e);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+      return;
+    }
+
+    // GET /api/diag/summary — Get diagnostic summary/stats
+    if (req.method === 'GET' && urlPath === '/api/diag/summary') {
+      try {
+        const VoiceBridge = require('./voice-bridge');
+        const voiceDiag = VoiceBridge.voiceBridgeInstance?.diag;
+        if (!voiceDiag) {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Voice bridge not initialized' }));
+          return;
+        }
+        const summary = voiceDiag.exportSummary();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(summary, null, 2));
+      } catch (e) {
+        console.error('[Diag API] Error:', e);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+      return;
+    }
+
+    // GET /api/diag/files — List available log files
+    if (req.method === 'GET' && urlPath === '/api/diag/files') {
+      try {
+        const VoiceBridge = require('./voice-bridge');
+        const voiceDiag = VoiceBridge.voiceBridgeInstance?.diag;
+        if (!voiceDiag) {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Voice bridge not initialized' }));
+          return;
+        }
+        const files = voiceDiag.listLogFiles();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ files }));
+      } catch (e) {
+        console.error('[Diag API] Error:', e);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
       return;
     }
 

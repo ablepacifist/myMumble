@@ -71,6 +71,10 @@ async function main() {
   const wsServer = new BridgeWebSocketServer(mumble);
   await wsServer.start();
 
+  // Make voice bridge instance globally accessible for diagnostics API
+  const VoiceBridge = require('./voice-bridge');
+  VoiceBridge.voiceBridgeInstance = wsServer.voiceBridge;
+
   // 4. Start Bot engine
   console.log('[Boot] Starting bot engine...');
   const bot = new BotEngine(mumble, wsServer);
