@@ -1,0 +1,84 @@
+name: Build MumbleChat Client
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'mumble-client/**'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'mumble-client/**'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: mumble-client
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: mumble-client/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build Windows exe
+        run: npm run package-win
+
+      - name: Upload Windows portable exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: MumbleChat-Windows-Portable
+          path: mumble-client/dist/*.exe
+          retention-days: 30
+
+  build-linux:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mumble-client
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: mumble-client/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build Linux AppImage
+        run: npm run package-linux
+
+      - name: Upload Linux AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: MumbleChat-Linux-AppImage
+          path: mumble-client/dist/*.AppImage
+          retention-days: 30
+
+      - name: Upload Linux deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: MumbleChat-Linux-deb
+          path: mumble-client/dist/*.deb
+          retention-days: 30

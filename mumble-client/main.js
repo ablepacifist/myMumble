@@ -32,8 +32,8 @@ let mixerInterval = null;
 
 // ── Default Config ──
 const DEFAULT_CONFIG = {
-  mumbleHost: '46.110.37.62',
-  mumblePort: 64738,
+  mumbleHost: 'group-wildness.gl.at.ply.gg',
+  mumblePort: 58938,
   lexiconUrl: 'http://147.185.221.24:15856',
   superUsers: ['alex'],
 };
