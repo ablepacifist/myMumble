@@ -160,32 +160,24 @@ class VoiceSession {
     this.opusDecoders = new Map(); // senderSession -> { decoder, lastUsed }
     this._decoderCleanupInterval = setInterval(() => this._cleanupIdleDecoders(), 30000);
 
-    // ── Audio Mixer ──
-    // Mumble sends SEPARATE Opus streams per talking user — it does NOT mix.
-    // Without mixing, each sender's decoded PCM gets appended sequentially to
-    // the browser's playback buffer, causing speakers to alternate every 20ms
-    // instead of being heard simultaneously. This makes multi-user speech
-    // completely unintelligible.
-    //
-    // Solution: accumulate decoded PCM from ALL senders into a mixing buffer.
-    // Every 20ms, flush the mixed result to the browser as a single frame.
-    this._mixBuf = new Int16Array(bridge.samplesPerFrame);  // 960 samples
-    this._mixSources = 0;       // How many senders contributed to current mix
-    this._mixSenderSet = new Set(); // Which senders are in current mix window
-    this._mixDirty = false;
-    this._mixTimer = setInterval(() => this._flushMixBuffer(), bridge.frameDuration);
-    this._mixFramesSent = 0;    // Total mixed frames sent to browser
+    // ── No server-side mixer ──
+    // Audio mixing is done in the browser's AudioWorklet, which runs on the
+    // hardware audio clock with exact timing. The server sends each decoded
+    // PCM frame immediately with a 4-byte sender session ID prefix, and the
+    // AudioWorklet maintains per-sender jitter buffers and mixes at playback.
+    // This eliminates the Node.js setInterval timing jitter that was causing
+    // 9-13% of frames to arrive at 40ms instead of 20ms.
 
     // ── Diagnostic counters ──
-    this._diag = { pcmIn: 0, opusOut: 0, mumbleIn: 0, pcmOut: 0, encErr: 0, decErr: 0, wsErr: 0, echoSkip: 0, mixFlush: 0, mixMulti: 0 };
+    this._diag = { pcmIn: 0, opusOut: 0, mumbleIn: 0, pcmOut: 0, encErr: 0, decErr: 0, wsErr: 0, echoSkip: 0 };
     // Accumulated totals that survive periodic resets — used in session_final_stats
-    this._diagTotals = { pcmIn: 0, opusOut: 0, mumbleIn: 0, pcmOut: 0, encErr: 0, decErr: 0, wsErr: 0, echoSkip: 0, mixFlush: 0, mixMulti: 0 };
+    this._diagTotals = { pcmIn: 0, opusOut: 0, mumbleIn: 0, pcmOut: 0, encErr: 0, decErr: 0, wsErr: 0, echoSkip: 0 };
     // Frame drop tracking (must be initialized before any audio processing)
     this._frameDrops = { droppedByBuffering: 0, droppedByError: 0 };
     this._diagInterval = setInterval(() => {
       const d = this._diag;
-      if (d.pcmIn || d.mumbleIn || d.mixFlush) {
-        console.log(`[Voice][DIAG] ${this.username}: pcmIn=${d.pcmIn} opusOut=${d.opusOut} mumbleIn=${d.mumbleIn} pcmOut=${d.pcmOut} mixFlush=${d.mixFlush} mixMulti=${d.mixMulti} echoSkip=${d.echoSkip} encErr=${d.encErr} decErr=${d.decErr} wsErr=${d.wsErr}`);
+      if (d.pcmIn || d.mumbleIn || d.pcmOut) {
+        console.log(`[Voice][DIAG] ${this.username}: pcmIn=${d.pcmIn} opusOut=${d.opusOut} mumbleIn=${d.mumbleIn} pcmOut=${d.pcmOut} echoSkip=${d.echoSkip} encErr=${d.encErr} decErr=${d.decErr} wsErr=${d.wsErr}`);
         this.bridge.diag.log('diag_interval', {
           username: this.username,
           ...d,
@@ -196,7 +188,7 @@ class VoiceSession {
       for (const key of Object.keys(d)) {
         this._diagTotals[key] = (this._diagTotals[key] || 0) + d[key];
       }
-      this._diag = { pcmIn: 0, opusOut: 0, mumbleIn: 0, pcmOut: 0, encErr: 0, decErr: 0, wsErr: 0, echoSkip: 0, mixFlush: 0, mixMulti: 0 };
+      this._diag = { pcmIn: 0, opusOut: 0, mumbleIn: 0, pcmOut: 0, encErr: 0, decErr: 0, wsErr: 0, echoSkip: 0 };
     }, 5000);
   }
 
@@ -374,11 +366,10 @@ class VoiceSession {
   }
 
   /**
-   * Receive audio from Mumble, decode Opus → PCM, mix into output buffer.
-   * Mumble sends SEPARATE Opus streams per talking user, so we need a
-   * dedicated decoder for each sender to maintain correct Opus state.
-   * Decoded PCM is mixed additively into _mixBuf; _flushMixBuffer sends
-   * the combined result to the browser every 20ms.
+   * Receive audio from Mumble, decode Opus → PCM, send immediately to browser.
+   * Each frame is prefixed with a 4-byte sender session ID (UInt32LE) so the
+   * browser's AudioWorklet can maintain per-sender jitter buffers and mix
+   * multiple speakers at playback time with hardware-accurate timing.
    */
   _onMumbleAudio(payload) {
     if (payload.length < 2) return;
@@ -432,95 +423,52 @@ class VoiceSession {
       return; // Skip bad frames
     }
 
-    // Mix decoded PCM into the output buffer (additive mixing with clamping).
-    // This is the critical fix: instead of sending each sender's PCM as a
-    // separate WS message (which causes them to play sequentially / interleaved),
-    // we ADD all senders' samples together so they play simultaneously.
-    this._mixIntoBuffer(pcmBuffer, senderSession);
+    // Send decoded PCM to browser immediately — no buffering, no timer.
+    // Prefix with 4-byte sender session ID so the AudioWorklet can maintain
+    // per-sender ring buffers and mix them at hardware clock precision.
+    this._sendPcmToBrowser(pcmBuffer, senderSession);
   }
 
   /**
-   * Additively mix decoded PCM samples into the mix buffer.
+   * Send decoded PCM to the browser with a sender session ID prefix.
    * @param {Buffer} pcmBuffer - Int16LE PCM from Opus decode (960 samples = 1920 bytes)
    * @param {number} senderSession - Mumble session ID of the audio source
    */
-  _mixIntoBuffer(pcmBuffer, senderSession) {
-    const int16 = new Int16Array(
-      pcmBuffer.buffer, pcmBuffer.byteOffset, pcmBuffer.byteLength / 2
-    );
-    const len = Math.min(int16.length, this._mixBuf.length);
+  _sendPcmToBrowser(pcmBuffer, senderSession) {
+    if (!this.ws || this.ws.readyState !== 1) return;
 
-    for (let i = 0; i < len; i++) {
-      // Additive mix: sum samples, clamp to Int16 range
-      const sum = this._mixBuf[i] + int16[i];
-      this._mixBuf[i] = sum > 32767 ? 32767 : sum < -32768 ? -32768 : sum;
+    const MAX_BUFFERED = 1920 * 10; // 10 frames × 1920 bytes = ~200ms
+
+    this.bridge.diag.metric('ws_buffer_amount', this.ws.bufferedAmount, { username: this.username });
+
+    if (this.ws.bufferedAmount > MAX_BUFFERED) {
+      this._diag.wsErr++;
+      this._frameDrops.droppedByBuffering++;
+      this.bridge.diag.log('frame_drop_buffering', {
+        username: this.username,
+        bufferedAmount: this.ws.bufferedAmount,
+        maxAllowed: MAX_BUFFERED,
+        senderSession,
+      });
+      return;
     }
 
-    this._mixSenderSet.add(senderSession);
-    this._mixSources = this._mixSenderSet.size;
-    this._mixDirty = true;
-  }
-
-  /**
-   * Flush the mixed audio buffer to the browser.
-   * Called every 20ms by _mixTimer. Sends one combined PCM frame containing
-   * the additive mix of all senders who contributed during this window.
-   */
-  _flushMixBuffer() {
-    if (!this._mixDirty) return;
-
-    if (this.ws && this.ws.readyState === 1) {
-      const MAX_BUFFERED = 1920 * 5; // 5 frames × 1920 bytes = ~100ms
-
-      this.bridge.diag.metric('ws_buffer_amount', this.ws.bufferedAmount, { username: this.username });
-
-      if (this.ws.bufferedAmount > MAX_BUFFERED) {
-        this._diag.wsErr++;
-        this._frameDrops.droppedByBuffering++;
-        this.bridge.diag.log('frame_drop_buffering', {
-          username: this.username,
-          bufferedAmount: this.ws.bufferedAmount,
-          maxAllowed: MAX_BUFFERED,
-          mixSources: this._mixSources,
-        });
-      } else {
-        try {
-          // Send the mixed buffer as Int16LE binary
-          const outBuf = Buffer.from(
-            this._mixBuf.buffer, this._mixBuf.byteOffset, this._mixBuf.byteLength
-          );
-          // Must copy — _mixBuf gets cleared immediately after
-          this.ws.send(Buffer.from(outBuf), { binary: true });
-          this._diag.pcmOut++;
-          this._diag.mixFlush++;
-
-          // Track multi-sender mix events for diagnostics
-          if (this._mixSources > 1) {
-            this._diag.mixMulti++;
-            this.bridge.diag.log('mix_multi_source', {
-              username: this.username,
-              sources: this._mixSources,
-              senders: Array.from(this._mixSenderSet),
-            });
-          }
-        } catch (err) {
-          this._diag.wsErr++;
-          this._frameDrops.droppedByError++;
-          console.error(`[Voice][DIAG] WS send error for ${this.username}:`, err.message);
-          this.bridge.diag.log('ws_send_error', {
-            username: this.username,
-            error: err.message,
-            readyState: this.ws.readyState,
-          });
-        }
-      }
+    try {
+      // 4-byte sender session ID prefix (UInt32LE) + PCM data
+      const prefix = Buffer.alloc(4);
+      prefix.writeUInt32LE(senderSession, 0);
+      this.ws.send(Buffer.concat([prefix, pcmBuffer]), { binary: true });
+      this._diag.pcmOut++;
+    } catch (err) {
+      this._diag.wsErr++;
+      this._frameDrops.droppedByError++;
+      console.error(`[Voice][DIAG] WS send error for ${this.username}:`, err.message);
+      this.bridge.diag.log('ws_send_error', {
+        username: this.username,
+        error: err.message,
+        readyState: this.ws.readyState,
+      });
     }
-
-    // Reset mix buffer for next window
-    this._mixBuf.fill(0);
-    this._mixSenderSet.clear();
-    this._mixSources = 0;
-    this._mixDirty = false;
   }
 
   /**
@@ -741,10 +689,6 @@ class VoiceSession {
     if (this._diagInterval) {
       clearInterval(this._diagInterval);
       this._diagInterval = null;
-    }
-    if (this._mixTimer) {
-      clearInterval(this._mixTimer);
-      this._mixTimer = null;
     }
     if (this._decoderCleanupInterval) {
       clearInterval(this._decoderCleanupInterval);

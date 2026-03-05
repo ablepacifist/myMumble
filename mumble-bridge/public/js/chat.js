@@ -1228,10 +1228,18 @@
 
   function handleAudioFromServer(data) {
     if (!voiceWorklet || isDeafened) return;
-    const int16 = new Int16Array(data);
+
+    // Server sends: 4-byte sender session ID (UInt32LE) + Int16LE PCM
+    // The sender ID lets the AudioWorklet maintain per-sender ring buffers
+    // and mix multiple speakers at hardware clock precision.
+    const view = new DataView(data);
+    const senderId = view.getUint32(0, true); // Little-endian
+
+    // Skip the 4-byte prefix, rest is Int16LE PCM
+    const int16 = new Int16Array(data, 4);
     const float32 = new Float32Array(int16.length);
     for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
-    voiceWorklet.port.postMessage({ type: 'playback', samples: float32 }, [float32.buffer]);
+    voiceWorklet.port.postMessage({ type: 'playback', senderId, samples: float32 }, [float32.buffer]);
   }
 
   function stopVoice() {
