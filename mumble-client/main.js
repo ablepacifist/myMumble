@@ -173,19 +173,21 @@ ipcMain.handle('mumble:connect', async (_event, { host, port, username }) => {
     stopMixer();
   });
 
-  // Audio from Mumble → mix into accumulator buffer immediately.
-  // This is the critical fix from the bridge: instead of queuing frames
-  // per-sender and popping one per tick (which falls behind on bursts),
-  // we additively mix ALL incoming PCM into a single buffer that gets
-  // flushed every 20ms.
+  // Audio from Mumble → forward per-sender frames immediately.
+  // Each incoming audio event has a senderSession and decoded PCM.
+  // We convert Int16 → Float32 and send to the renderer with the
+  // sender ID, so the AudioWorklet can maintain per-sender ring
+  // buffers and mix at hardware clock precision. This eliminates the
+  // Node.js setInterval timing jitter from the old accumulator mixer.
   mumble.on('audio', ({ senderSession, pcm }) => {
     voiceDiag.audioIn++;
-    const len = Math.min(pcm.length, MIX_FRAME);
-    for (let i = 0; i < len; i++) {
-      const sum = mixBuf[i] + pcm[i];
-      mixBuf[i] = sum > 32767 ? 32767 : sum < -32768 ? -32768 : sum;
+    // Convert Int16 PCM to Float32 for the AudioWorklet
+    const float32 = new Float32Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) {
+      float32[i] = pcm[i] / 32768;
     }
-    mixDirty = true;
+    send('mumble:audio-data', { senderId: senderSession, samples: float32 });
+    voiceDiag.audioOut++;
   });
 
   try {
@@ -338,21 +340,9 @@ ipcMain.on('mumble:set-config', (_event, config) => {
 function startMixer() {
   stopMixer();
 
-  // Flush the mix buffer every 20ms (one Opus frame duration).
-  // Only sends if at least one sender contributed audio this window.
-  mixerInterval = setInterval(() => {
-    if (!mainWindow || mainWindow.isDestroyed()) return;
-    if (!mixDirty) return;
-
-    // Copy the buffer before sending (it gets cleared immediately)
-    const out = Buffer.from(mixBuf.buffer, mixBuf.byteOffset, mixBuf.byteLength);
-    send('mumble:audio-data', Buffer.from(out));
-    voiceDiag.mixFlush++;
-
-    // Reset for next 20ms window
-    mixBuf.fill(0);
-    mixDirty = false;
-  }, 20);
+  // No mixer interval needed — per-sender frames are forwarded immediately
+  // from the 'audio' event handler. The AudioWorklet handles all mixing
+  // at hardware clock precision.
 
   // Clean up idle Opus decoders every 30s (60s idle timeout)
   decoderCleanupInterval = setInterval(() => {

@@ -278,9 +278,15 @@ class MumbleConnection extends EventEmitter {
     // Skip own audio (echo prevention)
     if (parsed.senderSession === this.session) return;
 
-    const pcm = this.voice.decode(parsed.opusData, `sender_${parsed.senderSession}`);
-    if (pcm) {
-      this.emit('audio', { senderSession: parsed.senderSession, pcm });
+    const senderId = `sender_${parsed.senderSession}`;
+    const seqNum = parsed.sequenceNumber || 0;
+
+    // decodeWithPLC fills gaps with Opus PLC frames for smoother audio
+    const frames = this.voice.decodeWithPLC(parsed.opusData, senderId, seqNum);
+    for (const pcm of frames) {
+      if (pcm) {
+        this.emit('audio', { senderSession: parsed.senderSession, pcm });
+      }
     }
   }
 

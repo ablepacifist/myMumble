@@ -779,11 +779,16 @@
 
   function handleAudioFromServer(data) {
     if (!voiceWorklet || isDeafened) return;
-    // data is a Buffer/ArrayBuffer from main process containing Int16LE PCM
-    const int16 = new Int16Array(data instanceof ArrayBuffer ? data : data.buffer || data);
-    const float32 = new Float32Array(int16.length);
-    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
-    voiceWorklet.port.postMessage({ type: 'playback', samples: float32 }, [float32.buffer]);
+    // data is { senderId: number, samples: Float32Array } from main process
+    if (data && data.senderId !== undefined && data.samples) {
+      const float32 = data.samples instanceof Float32Array
+        ? data.samples
+        : new Float32Array(data.samples);
+      voiceWorklet.port.postMessage(
+        { type: 'playback', senderId: data.senderId, samples: float32 },
+        [float32.buffer]
+      );
+    }
   }
 
   function stopVoice() {

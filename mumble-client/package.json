@@ -26,11 +26,17 @@
       "node_modules/**/*"
     ],
     "win": {
-      "target": ["portable", "nsis"],
+      "target": [
+        "portable",
+        "nsis"
+      ],
       "icon": "src/renderer/assets/icon.png"
     },
     "linux": {
-      "target": ["AppImage", "deb"],
+      "target": [
+        "AppImage",
+        "deb"
+      ],
       "icon": "src/renderer/assets/icon.png",
       "category": "Network"
     },
@@ -45,9 +51,9 @@
     "protobufjs": "^7.2.5"
   },
   "devDependencies": {
+    "chai": "^4.5.0",
     "electron": "^28.0.0",
     "electron-builder": "^24.9.1",
-    "mocha": "^10.2.0",
-    "chai": "^4.3.10"
+    "mocha": "^10.8.2"
   }
 }

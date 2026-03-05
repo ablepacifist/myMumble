@@ -1,66 +1,100 @@
 /**
  * AudioWorklet processor for voice chat.
- * Captures mic PCM and plays back received PCM via a ring buffer.
+ * Runs on the audio thread — captures mic PCM and plays received PCM.
+ *
+ * Uses per-sender ring buffers so multiple speakers are mixed at hardware
+ * clock precision. Each sender gets independent jitter buffering, and the
+ * process() callback additively mixes all active senders every 128 samples
+ * (~2.67ms at 48kHz). This eliminates the Node.js setInterval timing jitter
+ * that was causing choppy audio.
  *
  * Messages from main thread:
- *   { type: 'playback', samples: Float32Array }  — audio to play
- *   { type: 'mute', muted: boolean }             — mute/unmute mic
+ *   { type: 'playback', senderId: number, samples: Float32Array }  — audio from a specific sender
+ *   { type: 'mute', muted: boolean }                                — mute/unmute mic
  *
  * Messages to main thread:
- *   { type: 'capture', samples: Int16Array }      — captured mic audio
+ *   { type: 'capture', samples: Int16Array }  — mic audio captured
  */
 class VoiceProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this.muted = false;
 
-    // Ring buffer for playback (1 second @ 48kHz)
-    this._ringSize = 48000;
-    this._ring = new Float32Array(this._ringSize);
-    this._writePos = 0;
-    this._readPos = 0;
-    this._buffered = 0;
+    // ── Per-sender ring buffers for playback ──
+    this._senders = new Map(); // senderId -> sender state object
+    this._ringSize = 48000;    // 1 second at 48kHz per sender
 
-    // Jitter buffer — wait for 3 frames (60ms) before starting playback
-    this._jitterThreshold = 960 * 3;
-    this._playing = false;
+    // ── Jitter buffer settings ──
+    this._jitterThreshold = 960 * 3; // 60ms — 3 Opus frames before playing
+
+    // Once playing, DON'T reset on brief gaps. Only stop after sustained
+    // silence (~100ms) to prevent re-buffer penalty on momentary jitter.
+    this._dryThreshold = 960 * 5; // 100ms
 
     this.port.onmessage = (e) => {
       if (e.data.type === 'playback') {
-        this._writeToRing(e.data.samples);
+        this._writeToSenderRing(e.data.senderId, e.data.samples);
       } else if (e.data.type === 'mute') {
         this.muted = e.data.muted;
       }
     };
   }
 
-  _writeToRing(samples) {
+  /**
+   * Get or create a ring buffer for a specific sender.
+   */
+  _getOrCreateSender(senderId) {
+    let s = this._senders.get(senderId);
+    if (!s) {
+      s = {
+        ring: new Float32Array(this._ringSize),
+        writePos: 0,
+        readPos: 0,
+        buffered: 0,
+        playing: false,
+        drySamples: 0,
+      };
+      this._senders.set(senderId, s);
+    }
+    return s;
+  }
+
+  /**
+   * Write incoming samples into a specific sender's ring buffer.
+   */
+  _writeToSenderRing(senderId, samples) {
+    const s = this._getOrCreateSender(senderId);
     const len = samples.length;
 
-    // Drop oldest if overflow
-    if (this._buffered + len > this._ringSize) {
-      const overflow = (this._buffered + len) - this._ringSize;
-      this._readPos = (this._readPos + overflow) % this._ringSize;
-      this._buffered -= overflow;
+    // If buffer would overflow, drop oldest audio to make room
+    if (s.buffered + len > this._ringSize) {
+      const overflow = (s.buffered + len) - this._ringSize;
+      s.readPos = (s.readPos + overflow) % this._ringSize;
+      s.buffered -= overflow;
     }
 
-    const spaceToEnd = this._ringSize - this._writePos;
+    // Write samples into ring, wrapping around if needed
+    const spaceToEnd = this._ringSize - s.writePos;
     if (len <= spaceToEnd) {
-      this._ring.set(samples, this._writePos);
+      s.ring.set(samples, s.writePos);
     } else {
-      this._ring.set(samples.subarray(0, spaceToEnd), this._writePos);
-      this._ring.set(samples.subarray(spaceToEnd), 0);
+      s.ring.set(samples.subarray(0, spaceToEnd), s.writePos);
+      s.ring.set(samples.subarray(spaceToEnd), 0);
     }
-    this._writePos = (this._writePos + len) % this._ringSize;
-    this._buffered += len;
+    s.writePos = (s.writePos + len) % this._ringSize;
+    s.buffered += len;
 
-    if (!this._playing && this._buffered >= this._jitterThreshold) {
-      this._playing = true;
+    // Reset dry counter — we got new data for this sender
+    s.drySamples = 0;
+
+    // Start playing once we've buffered enough (jitter buffer filled)
+    if (!s.playing && s.buffered >= this._jitterThreshold) {
+      s.playing = true;
     }
   }
 
   process(inputs, outputs) {
-    // ── Capture mic ──
+    // ── Capture: send mic audio to main thread ──
     const input = inputs[0];
     if (input && input[0] && input[0].length > 0 && !this.muted) {
       const float32 = input[0];
@@ -72,45 +106,55 @@ class VoiceProcessor extends AudioWorkletProcessor {
       this.port.postMessage({ type: 'capture', samples: int16 }, [int16.buffer]);
     }
 
-    // ── Playback ──
+    // ── Playback: mix all sender buffers to output ──
     const output = outputs[0];
     if (output && output[0]) {
       const outChannel = output[0];
-      const needed = outChannel.length;
+      const needed = outChannel.length; // typically 128 samples
 
-      if (!this._playing || this._buffered === 0) {
-        outChannel.fill(0);
-        if (this._playing && this._buffered === 0) {
-          this._playing = false;
-        }
-      } else if (this._buffered >= needed) {
-        const readEnd = this._readPos + needed;
-        if (readEnd <= this._ringSize) {
-          outChannel.set(this._ring.subarray(this._readPos, readEnd));
+      // Start with silence
+      outChannel.fill(0);
+
+      for (const [id, s] of this._senders) {
+        if (!s.playing) continue;
+
+        if (s.buffered >= needed) {
+          // Normal path: read from this sender's ring buffer and ADD to output
+          for (let i = 0; i < needed; i++) {
+            outChannel[i] += s.ring[(s.readPos + i) % this._ringSize];
+          }
+          s.readPos = (s.readPos + needed) % this._ringSize;
+          s.buffered -= needed;
+          s.drySamples = 0;
+        } else if (s.buffered > 0) {
+          // Partial data — read what we have, rest stays silence
+          const avail = s.buffered;
+          for (let i = 0; i < avail; i++) {
+            outChannel[i] += s.ring[(s.readPos + i) % this._ringSize];
+          }
+          s.readPos = (s.readPos + avail) % this._ringSize;
+          s.buffered = 0;
+          s.drySamples += (needed - avail);
         } else {
-          const first = this._ringSize - this._readPos;
-          outChannel.set(this._ring.subarray(this._readPos, this._ringSize), 0);
-          outChannel.set(this._ring.subarray(0, needed - first), first);
+          // No data from this sender — count dry samples
+          s.drySamples += needed;
+          if (s.drySamples >= this._dryThreshold) {
+            // Sender has been silent long enough — stop playing
+            // (will re-buffer on next audio arrival)
+            s.playing = false;
+            s.drySamples = 0;
+          }
         }
-        this._readPos = readEnd % this._ringSize;
-        this._buffered -= needed;
-      } else {
-        const avail = this._buffered;
-        if (this._readPos + avail <= this._ringSize) {
-          outChannel.set(this._ring.subarray(this._readPos, this._readPos + avail), 0);
-        } else {
-          const first = this._ringSize - this._readPos;
-          outChannel.set(this._ring.subarray(this._readPos, this._ringSize), 0);
-          outChannel.set(this._ring.subarray(0, avail - first), first);
-        }
-        for (let i = avail; i < needed; i++) outChannel[i] = 0;
-        this._readPos = (this._readPos + avail) % this._ringSize;
-        this._buffered = 0;
-        this._playing = false;
+      }
+
+      // Clamp output to [-1, 1] to prevent distortion from mixing
+      for (let i = 0; i < needed; i++) {
+        if (outChannel[i] > 1) outChannel[i] = 1;
+        else if (outChannel[i] < -1) outChannel[i] = -1;
       }
     }
 
-    return true;
+    return true; // Keep processor alive
   }
 }
 

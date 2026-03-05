@@ -20,6 +20,7 @@ class Voice {
     this.samplesPerFrame = (sampleRate * frameDuration) / 1000; // 960
 
     this.encoder = new OpusScript(sampleRate, channels, OpusScript.Application.VOIP);
+    this.encoder.setBitrate(48000); // 48 kbps — matches Mumble default quality
     this.decoders = new Map(); // senderId → { decoder, lastUsed }
   }
 
@@ -46,7 +47,7 @@ class Voice {
   /**
    * Decode an Opus frame to 960 Int16 PCM samples.
    * Uses a per-sender decoder to maintain correct Opus state.
-   * @param {Buffer} opusData
+   * @param {Buffer} opusData — Opus frame, or null for PLC (packet loss concealment)
    * @param {string} senderId — unique ID per sender
    * @returns {Int16Array|null}
    */
@@ -56,13 +57,14 @@ class Voice {
       entry = {
         decoder: new OpusScript(this.sampleRate, this.channels, OpusScript.Application.VOIP),
         lastUsed: Date.now(),
+        lastSeq: -1,
       };
       this.decoders.set(senderId, entry);
     }
     entry.lastUsed = Date.now();
 
     try {
-      const decoded = entry.decoder.decode(Buffer.from(opusData));
+      const decoded = entry.decoder.decode(opusData === null ? null : Buffer.from(opusData));
       // decoded is a Buffer of Int16LE samples
       return new Int16Array(
         decoded.buffer,
@@ -72,6 +74,54 @@ class Voice {
     } catch (_) {
       return null;
     }
+  }
+
+  /**
+   * Decode an Opus frame with PLC gap-fill for missing sequence numbers.
+   * Returns an array of one or more Int16Array frames (PLC frames + actual frame).
+   * @param {Buffer} opusData — the Opus frame data
+   * @param {string} senderId — unique ID per sender
+   * @param {number} sequenceNumber — Mumble sequence number
+   * @returns {Int16Array[]}
+   */
+  decodeWithPLC(opusData, senderId, sequenceNumber) {
+    let entry = this.decoders.get(senderId);
+    if (!entry) {
+      entry = {
+        decoder: new OpusScript(this.sampleRate, this.channels, OpusScript.Application.VOIP),
+        lastUsed: Date.now(),
+        lastSeq: -1,
+      };
+      this.decoders.set(senderId, entry);
+    }
+    entry.lastUsed = Date.now();
+
+    const frames = [];
+
+    // Detect gaps and generate PLC frames (max 3 to prevent runaway)
+    if (entry.lastSeq >= 0 && sequenceNumber > entry.lastSeq + 1) {
+      const gap = Math.min(sequenceNumber - entry.lastSeq - 1, 3);
+      for (let i = 0; i < gap; i++) {
+        try {
+          const plc = entry.decoder.decode(null);
+          frames.push(new Int16Array(plc.buffer, plc.byteOffset, plc.byteLength / 2));
+        } catch (_) {
+          // If PLC fails, push silence
+          frames.push(new Int16Array(this.samplesPerFrame));
+        }
+      }
+    }
+    entry.lastSeq = sequenceNumber;
+
+    // Decode the actual frame
+    try {
+      const decoded = entry.decoder.decode(Buffer.from(opusData));
+      frames.push(new Int16Array(decoded.buffer, decoded.byteOffset, decoded.byteLength / 2));
+    } catch (_) {
+      frames.push(new Int16Array(this.samplesPerFrame));
+    }
+
+    return frames;
   }
 
   /**

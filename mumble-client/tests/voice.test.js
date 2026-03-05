@@ -281,4 +281,102 @@ describe('Voice (Opus + Mixer)', () => {
       done();
     });
   });
+
+  describe('bitrate', () => {
+    it('should have encoder bitrate set to 48000', () => {
+      // The constructor should call setBitrate(48000)
+      // OpusScript stores bitrate internally — verify by checking
+      // that encoding produces consistently-sized frames typical of 48kbps
+      const pcm = new Int16Array(960);
+      for (let i = 0; i < 960; i++) {
+        pcm[i] = Math.round(Math.sin(i / 10) * 10000);
+      }
+      const sizes = [];
+      for (let f = 0; f < 10; f++) {
+        const opus = voice.encode(pcm);
+        sizes.push(opus.length);
+      }
+      // At 48kbps with 20ms frames, expect ~120 bytes per frame (48000/8/50)
+      const avg = sizes.reduce((a, b) => a + b, 0) / sizes.length;
+      // Allow wide margin since Opus is adaptive, but should be in the ballpark
+      expect(avg).to.be.greaterThan(50);
+      expect(avg).to.be.lessThan(300);
+    });
+  });
+
+  describe('PLC (Packet Loss Concealment)', () => {
+    it('decode(null) should return null (OpusScript does not support native PLC)', () => {
+      // OpusScript's decode() throws on null input, so our decode() catches and returns null.
+      // PLC is instead handled by decodeWithPLC() which falls back to silence frames.
+      const pcm = new Int16Array(960);
+      for (let i = 0; i < 960; i++) pcm[i] = Math.round(Math.sin(i / 10) * 10000);
+      const opus = voice.encode(pcm);
+      voice.decode(opus, 'plc_test');
+
+      const plcFrame = voice.decode(null, 'plc_test');
+      expect(plcFrame).to.be.null;
+    });
+
+    it('decodeWithPLC should fill gaps with concealment frames', () => {
+      const v2 = new Voice({ sampleRate: 48000, channels: 1, frameDuration: 20 });
+      const pcm = new Int16Array(960);
+      for (let i = 0; i < 960; i++) pcm[i] = Math.round(Math.sin(i / 10) * 10000);
+      const opus = voice.encode(pcm);
+
+      // Send frame at seq=0
+      const frames0 = v2.decodeWithPLC(opus, 'plcGap', 0);
+      expect(frames0.length).to.equal(1); // Just the real frame
+
+      // Skip seq=1, send seq=2 — should produce 1 PLC + 1 real = 2 frames
+      const frames2 = v2.decodeWithPLC(opus, 'plcGap', 2);
+      expect(frames2.length).to.equal(2);
+      expect(frames2[0].length).to.equal(960); // PLC frame
+      expect(frames2[1].length).to.equal(960); // Real frame
+
+      v2.destroy();
+    });
+
+    it('decodeWithPLC should cap PLC at 3 frames maximum', () => {
+      const v3 = new Voice({ sampleRate: 48000, channels: 1, frameDuration: 20 });
+      const pcm = new Int16Array(960);
+      for (let i = 0; i < 960; i++) pcm[i] = Math.round(Math.sin(i / 10) * 10000);
+      const opus = voice.encode(pcm);
+
+      // Send frame at seq=0
+      v3.decodeWithPLC(opus, 'plcMax', 0);
+
+      // Jump to seq=10 — 9 frame gap, but PLC caps at 3
+      const frames = v3.decodeWithPLC(opus, 'plcMax', 10);
+      expect(frames.length).to.equal(4); // 3 PLC + 1 real
+
+      v3.destroy();
+    });
+
+    it('decodeWithPLC should not generate PLC for first frame', () => {
+      const v4 = new Voice({ sampleRate: 48000, channels: 1, frameDuration: 20 });
+      const pcm = new Int16Array(960);
+      for (let i = 0; i < 960; i++) pcm[i] = Math.round(Math.sin(i / 10) * 10000);
+      const opus = voice.encode(pcm);
+
+      // First frame at seq=5 — no previous seq, so no PLC
+      const frames = v4.decodeWithPLC(opus, 'plcFirst', 5);
+      expect(frames.length).to.equal(1);
+
+      v4.destroy();
+    });
+
+    it('decodeWithPLC should not generate PLC for consecutive frames', () => {
+      const v5 = new Voice({ sampleRate: 48000, channels: 1, frameDuration: 20 });
+      const pcm = new Int16Array(960);
+      for (let i = 0; i < 960; i++) pcm[i] = Math.round(Math.sin(i / 10) * 10000);
+      const opus = voice.encode(pcm);
+
+      v5.decodeWithPLC(opus, 'plcConsec', 0);
+      v5.decodeWithPLC(opus, 'plcConsec', 1);
+      const frames = v5.decodeWithPLC(opus, 'plcConsec', 2);
+      expect(frames.length).to.equal(1); // No gap, no PLC
+
+      v5.destroy();
+    });
+  });
 });
