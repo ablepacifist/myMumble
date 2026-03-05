@@ -9,6 +9,7 @@
     "test": "node tests/run-all.js",
     "test:http": "node tests/test-http-server.js",
     "test:ws": "node tests/test-ws-connect.js",
+    "test:ws:quality": "node tests/test-ws-quality.js",
     "test:voice": "node tests/test-voice-bridge.js",
     "test:e2e": "node tests/test-two-clients.js",
     "test:3way": "node tests/test-three-clients.js",

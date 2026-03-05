@@ -153,6 +153,7 @@ class VoiceSession {
 
     // Per-session Opus encoder (one encoder for OUR mic stream is fine)
     this.opusEncoder = new OpusScript(bridge.sampleRate, bridge.channels, OpusScript.Application.VOIP);
+    this.opusEncoder.setBitrate(48000); // 48 kbps — matches Mumble default quality
 
     // Per-SENDER Opus decoders. Mumble does NOT mix audio — it sends
     // separate Opus streams per talking user, each with their own state.
@@ -400,12 +401,29 @@ class VoiceSession {
       entry = {
         decoder: new OpusScript(this.bridge.sampleRate, this.bridge.channels, OpusScript.Application.VOIP),
         lastUsed: Date.now(),
+        lastSeq: -1,
       };
       this.opusDecoders.set(senderSession, entry);
       console.log(`[Voice][DIAG] ${this.username}: new decoder for sender session ${senderSession}`);
       this.bridge.diag.log('decoder_created', { username: this.username, senderSession });
     }
     entry.lastUsed = Date.now();
+
+    const seqNum = parsed.sequenceNumber || 0;
+
+    // PLC (Packet Loss Concealment): fill gaps with Opus-generated frames
+    if (entry.lastSeq >= 0 && seqNum > entry.lastSeq + 1) {
+      const gap = Math.min(seqNum - entry.lastSeq - 1, 3); // max 3 PLC frames
+      for (let i = 0; i < gap; i++) {
+        try {
+          const plcBuffer = entry.decoder.decode(null);
+          this._sendPcmToBrowser(plcBuffer, senderSession);
+        } catch (_) {
+          // PLC failure is non-critical, skip
+        }
+      }
+    }
+    entry.lastSeq = seqNum;
 
     // Decode Opus to PCM using the sender-specific decoder
     let pcmBuffer;
@@ -574,6 +592,7 @@ class VoiceSession {
       if (!decoded.opusData || decoded.opusData.length === 0) return null;
       return {
         senderSession: decoded.senderSession || 0,
+        sequenceNumber: decoded.frameNumber ? Number(decoded.frameNumber) : 0,
         opusData: decoded.opusData,
       };
     } catch (err) {
@@ -604,6 +623,7 @@ class VoiceSession {
     if (opusSize === 0 || offset + opusSize > payload.length) return null;
     return {
       senderSession: session.value,
+      sequenceNumber: seq.value,
       opusData: payload.slice(offset, offset + opusSize),
     };
   }
