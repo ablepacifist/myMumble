@@ -177,12 +177,12 @@
         outputDeviceId: 'default',
         inputVolume: 100,
         outputVolume: 100,
-        vadThreshold: 200,
+        vadThreshold: 50,
         echoCancellation: true,
         noiseSuppression: true,
         autoGainControl: true,
       }, s || {});
-    } catch { return { inputDeviceId: 'default', outputDeviceId: 'default', inputVolume: 100, outputVolume: 100, vadThreshold: 200, echoCancellation: true, noiseSuppression: true, autoGainControl: true }; }
+    } catch { return { inputDeviceId: 'default', outputDeviceId: 'default', inputVolume: 100, outputVolume: 100, vadThreshold: 50, echoCancellation: true, noiseSuppression: true, autoGainControl: true }; }
   }
 
   function saveVoiceSettings() {
@@ -1156,7 +1156,7 @@
       // stops to avoid clipping word endings (consonants are quiet).
       // holdFrames counts down from VAD_HOLD_FRAMES each time we detect speech,
       // and we keep sending until it reaches 0.
-      const VAD_HOLD_FRAMES = 15; // 15 × 20ms = 300ms tail after speech drops
+      const VAD_HOLD_FRAMES = 25; // 25 × 20ms = 500ms tail after speech drops
       let vadHoldCounter = 0;
 
       voiceWorklet.port.onmessage = (e) => {
