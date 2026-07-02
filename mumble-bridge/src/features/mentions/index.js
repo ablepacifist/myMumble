@@ -141,6 +141,17 @@ class MentionsFeature {
               data: { type: 'mention', channelId, channelName, fromUsername },
             }).catch(() => {});
           }
+
+          // Also surface the mention in the Lexicon app (bell/toasts).
+          // deliverPush=false — OS push is already routed above.
+          const notifFeature = require('../notifications');
+          notifFeature.notifyMention({
+            targetUserId,
+            fromUsername,
+            fromUserId: fromUserId || null,
+            channelId,
+            preview,
+          }).catch(() => {});
         } catch (err) {
           console.error(`[Mentions] Failed to store notification for ${mentionedName}: ${err.message}`);
         }

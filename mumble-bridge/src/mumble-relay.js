@@ -3,6 +3,7 @@
  */
 
 const lexicon = require('./lexicon-client');
+const featureRegistry = require('./feature-registry');
 
 /**
  * Set up listeners on the Mumble connection to relay events to web clients.
@@ -14,6 +15,9 @@ const lexicon = require('./lexicon-client');
 function setupMumbleListeners(mumble, state, broadcastAll, broadcastToChannel) {
   mumble.on('ServerSync', (msg) => {
     state.ownSession = msg.session;
+    // Initial sync done — the server replays existing users right after we
+    // connect; only UserState changes after this point count as real joins.
+    state.synced = true;
     console.log(`[Mumble] Synced. Our session: ${msg.session}`);
   });
 
@@ -36,6 +40,7 @@ function setupMumbleListeners(mumble, state, broadcastAll, broadcastToChannel) {
 
   mumble.on('UserState', (msg) => {
     const existing = state.users.get(msg.session) || {};
+    const prevChannelId = existing.channelId;
     const user = {
       session: msg.session,
       name: msg.name || existing.name || '',
@@ -47,6 +52,22 @@ function setupMumbleListeners(mumble, state, broadcastAll, broadcastToChannel) {
     };
     state.users.set(msg.session, user);
     broadcastAll({ type: 'user_update', user });
+
+    // Lexicon app notification on a genuine channel entry (connect or move)
+    // after initial sync. Web users are handled via voice_start; skip their
+    // web_* voice sessions and our own bridge session here.
+    const changedChannel = user.channelId !== undefined && user.channelId !== prevChannelId;
+    if (state.synced && changedChannel && msg.session !== state.ownSession
+        && user.name && !user.name.startsWith('web_')) {
+      const notifFeature = featureRegistry.features?.get('notifications');
+      if (notifFeature) {
+        notifFeature.notifyVoiceJoin({
+          name: user.name,
+          channelId: user.channelId,
+          channelName: state.channels.get(user.channelId)?.name,
+        }).catch(() => {});
+      }
+    }
   });
 
   mumble.on('UserRemove', (msg) => {
@@ -83,6 +104,35 @@ function setupMumbleListeners(mumble, state, broadcastAll, broadcastToChannel) {
           userId: 0,
           username: sender.name,
           content: rawText,
+        }).catch(() => {});
+      }
+    }
+
+    // Once per message (not per delivery channel): Lexicon app notification
+    // + @mention processing for native Mumble senders (parity with web).
+    if (rawText && sender?.name && channelIds.length > 0) {
+      const chId = channelIds[0];
+      const channelName = state.channels.get(chId)?.name || '';
+
+      const notifFeature = featureRegistry.features?.get('notifications');
+      if (notifFeature) {
+        notifFeature.notifyMessage({
+          senderName: sender.name,
+          channelId: chId,
+          channelName,
+          text: rawText,
+        }).catch(() => {});
+      }
+
+      const mentionsFeature = featureRegistry.features?.get('mentions');
+      if (mentionsFeature && mentionsFeature.processMentions) {
+        mentionsFeature.processMentions({
+          text: rawText,
+          fromUsername: sender.name,
+          fromUserId: null,
+          channelId: chId,
+          channelName,
+          messageId: null,
         }).catch(() => {});
       }
     }

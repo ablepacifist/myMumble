@@ -255,6 +255,18 @@ async function handleClientMessage(ws, msg, client, ctx) {
           messageId: msgId,
         }).catch(err => console.error(`[Mentions] Process failed: ${err.message}`));
       }
+
+      // Forward to Lexicon app notifications (async, non-blocking)
+      const notificationsFeature = featureRegistry.features?.get('notifications');
+      if (notificationsFeature) {
+        notificationsFeature.notifyMessage({
+          senderName: client.username,
+          fromUserId: client.userId || null,
+          channelId,
+          channelName,
+          text,
+        }).catch(() => {});
+      }
       break;
     }
 
@@ -462,6 +474,17 @@ async function handleClientMessage(ws, msg, client, ctx) {
           wc.inVoice = true;
           wc.voiceChannelId = voiceChId;
           ctx.broadcastAll({ type: 'voice_state', id: client.webClientId, username: client.username, inVoice: true, voiceChannelId: voiceChId });
+        }
+
+        // Forward to Lexicon app notifications (async, non-blocking)
+        const notifFeature = featureRegistry.features?.get('notifications');
+        if (notifFeature) {
+          notifFeature.notifyVoiceJoin({
+            name: client.username,
+            fromUserId: client.userId || null,
+            channelId: voiceChId || 0,
+            channelName: ctx.channels.get(voiceChId)?.name,
+          }).catch(() => {});
         }
       } catch (err) {
         console.error(`[Voice] Start error for ${client.username}:`, err.message);

@@ -477,6 +477,33 @@ class LexiconClient {
     }
   }
 
+  // ── Lexicon Notifications ──
+
+  /**
+   * Create a notification in the Lexicon app (bell / toasts / browser push).
+   * targetUserId null = broadcast to everyone except the actor; a number =
+   * directed (e.g. a mention). type: message | voice_join | mention | music.
+   * Set deliverPush=false when another system already handles OS push for
+   * this event (avoids double notifications).
+   */
+  async postNotification({ targetUserId = null, type, title, body = null, fromUsername = null, fromUserId = null, channelId = null, link = null, deliverPush = true }) {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/notifications`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ targetUserId, type, title, body, source: 'mumble', fromUsername, fromUserId, channelId, link, deliverPush }),
+      });
+      if (!res.ok) {
+        console.error(`[Lexicon] Failed to post notification: ${res.status}`);
+        return null;
+      }
+      return res.json();
+    } catch (err) {
+      console.error(`[Lexicon] postNotification error: ${err.message}`);
+      return null;
+    }
+  }
+
   // ── SSO Token Validation ──
 
   /**
