@@ -76,6 +76,19 @@ function createHttpServer(publicDir) {
       return;
     }
 
+    // ── Chat File Upload (proxy to Lexicon) ───────────────
+    // POST /api/chat/upload — Upload an image/GIF for chat
+    if (req.method === 'POST' && urlPath === '/api/chat/upload') {
+      handleChatFileUpload(req, res);
+      return;
+    }
+
+    // GET /api/chat/files/:id — Proxy file from Lexicon
+    if (req.method === 'GET' && urlPath.match(/^\/api\/chat\/files\/\d+(\/thumb)?$/)) {
+      proxyChatFile(req, res, urlPath);
+      return;
+    }
+
     // ── Diagnostics API (admin only, for testing) ─────────
     // GET /api/diag/logs — Get latest voice diagnostics
     if (req.method === 'GET' && urlPath.startsWith('/api/diag/logs')) {
@@ -135,6 +148,20 @@ function createHttpServer(publicDir) {
         res.end(JSON.stringify({ files }));
       } catch (e) {
         console.error('[Diag API] Error:', e);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+      return;
+    }
+
+    // GET /api/push/vapid-key — proxy to Lexicon
+    if (req.method === 'GET' && urlPath === '/api/push/vapid-key') {
+      try {
+        const lexicon = require('./lexicon-client');
+        const key = await lexicon.getVapidKey();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ publicKey: key }));
+      } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: e.message }));
       }
@@ -353,4 +380,121 @@ function parseMultipart(buffer, boundary) {
   }
 
   return parts;
+}
+
+// ── Chat File Upload Handler (proxy to Lexicon) ────────────
+const MAX_CHAT_FILE_SIZE = 8 * 1024 * 1024; // 8MB
+const ALLOWED_CHAT_FILE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+
+function handleChatFileUpload(req, res) {
+  const contentType = req.headers['content-type'] || '';
+  if (!contentType.includes('multipart/form-data')) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Expected multipart/form-data' }));
+    return;
+  }
+
+  const boundaryMatch = contentType.match(/boundary=(.+)/);
+  if (!boundaryMatch) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'No boundary found' }));
+    return;
+  }
+
+  const chunks = [];
+  let totalSize = 0;
+
+  req.on('data', (chunk) => {
+    totalSize += chunk.length;
+    if (totalSize > MAX_CHAT_FILE_SIZE + 8192) {
+      req.destroy();
+      return;
+    }
+    chunks.push(chunk);
+  });
+
+  req.on('end', async () => {
+    try {
+      const buffer = Buffer.concat(chunks);
+      const boundary = '--' + boundaryMatch[1];
+      const parts = parseMultipart(buffer, boundary);
+
+      const usernamePart = parts.find(p => p.name === 'username');
+      const userIdPart = parts.find(p => p.name === 'userId');
+      const channelIdPart = parts.find(p => p.name === 'channelId');
+      const filePart = parts.find(p => p.name === 'file' && p.filename);
+
+      if (!filePart || !userIdPart) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing required fields (file, userId)' }));
+        return;
+      }
+
+      const fileType = filePart.contentType || 'application/octet-stream';
+      if (!ALLOWED_CHAT_FILE_TYPES.includes(fileType)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unsupported file type: ' + fileType + '. Allowed: JPEG, PNG, GIF, WebP' }));
+        return;
+      }
+
+      if (filePart.data.length > MAX_CHAT_FILE_SIZE) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'File too large. Max 8MB.' }));
+        return;
+      }
+
+      const userId = parseInt(userIdPart.data.toString('utf8').trim());
+      const channelId = channelIdPart ? parseInt(channelIdPart.data.toString('utf8').trim()) : 0;
+
+      // Forward to Lexicon API
+      const lexicon = require('./lexicon-client');
+      const result = await lexicon.uploadChatFile(
+        filePart.data,
+        filePart.filename,
+        fileType,
+        userId,
+        channelId
+      );
+
+      console.log(`[Chat Upload] ${usernamePart ? usernamePart.data.toString('utf8').trim() : 'user_' + userId} uploaded ${filePart.filename} (${fileType}, ${filePart.data.length} bytes) → file ID ${result.id}`);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    } catch (e) {
+      console.error('[Chat Upload] Error:', e);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Upload failed: ' + e.message }));
+    }
+  });
+}
+
+// ── Chat File Proxy (serve Lexicon files through bridge) ───
+async function proxyChatFile(req, res, urlPath) {
+  try {
+    const lexicon = require('./lexicon-client');
+    const config = require('./config');
+    const targetUrl = config.lexicon.apiUrl + urlPath;
+
+    const proxyRes = await require('node-fetch')(targetUrl);
+
+    if (!proxyRes.ok) {
+      res.writeHead(proxyRes.status, { 'Content-Type': 'text/plain' });
+      res.end(proxyRes.status === 404 ? 'Not Found' : 'Error');
+      return;
+    }
+
+    const ct = proxyRes.headers.get('content-type') || 'application/octet-stream';
+    const buffer = await proxyRes.buffer();
+
+    res.writeHead(200, {
+      'Content-Type': ct,
+      'Cache-Control': 'public, max-age=31536000, immutable',
+      'Content-Length': buffer.length,
+    });
+    res.end(buffer);
+  } catch (e) {
+    console.error('[Chat File Proxy] Error:', e.message);
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Could not fetch file from Lexicon' }));
+  }
 }

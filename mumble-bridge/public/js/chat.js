@@ -11,6 +11,8 @@
   let userId = null;
   let isAdmin = false;
   let currentChannelId = 1;  // default to 'general' channel
+  let activeDMConversationId = null; // currently open DM conversation
+  let dmConversations = [];          // list of DM conversations
   let channels = new Map();       // id -> { id, name, parentId, ... }
   let users = new Map();          // session -> mumble user
   let webClients = new Map();     // web_userId -> { id, username, channelId, inVoice }
@@ -30,6 +32,9 @@
   // Avatar cache
   const avatarCache = {};
   const DEFAULT_AVATAR = '/uploads/avatars/default.jpg';
+
+  // SSO token (from ?token= query param)
+  let pendingSsoToken = null;
 
   // Voice settings (persisted to localStorage)
   let voiceSettings = loadVoiceSettings();
@@ -168,6 +173,53 @@
     return avatarCache[username] || DEFAULT_AVATAR;
   }
 
+  /**
+   * Format message content with rich text support:
+   * - URLs → clickable links
+   * - Image URLs → inline image previews
+   * - Markdown-style links [text](url) → clickable links
+   */
+  function formatMessageContent(text) {
+    if (!text) return '';
+    // Replace markdown links with placeholders first, then escape/linkify safely.
+    const markdownLinks = [];
+    const withPlaceholders = text.replace(
+      /\[([^\]]+)\]\(((?:https?:\/\/|www\.)[^\s)]+)\)/gi,
+      (_, label, url) => {
+        const idx = markdownLinks.push({ label, url }) - 1;
+        return `__MDLINK_${idx}__`;
+      }
+    );
+
+    let html = escapeHtml(withPlaceholders);
+
+    // Auto-detect plain URLs and convert to clickable links.
+    html = html.replace(
+      /((?:https?:\/\/|www\.)[^\s<]+[^\s<.,;:!?"')\]])/gi,
+      (url) => {
+        const href = url.startsWith('www.') ? 'https://' + url : url;
+        if (/\.(png|jpe?g|gif|webp)(\?[^\s]*)?$/i.test(url)) {
+          return `<a href="${href}" target="_blank" rel="noopener noreferrer" class="chat-link">${url}</a>` +
+            `<div class="embed-image"><img src="${href}" alt="Linked image" loading="lazy" ` +
+            `onclick="window.open('${href}','_blank')" ` +
+            `onerror="this.parentElement.style.display='none'"></div>`;
+        }
+        return `<a href="${href}" target="_blank" rel="noopener noreferrer" class="chat-link">${url}</a>`;
+      }
+    );
+
+    // Restore markdown links as anchors.
+    html = html.replace(/__MDLINK_(\d+)__/g, (_, idxRaw) => {
+      const idx = parseInt(idxRaw, 10);
+      const entry = markdownLinks[idx];
+      if (!entry) return '';
+      const href = entry.url.startsWith('www.') ? 'https://' + entry.url : entry.url;
+      return `<a href="${href}" target="_blank" rel="noopener noreferrer" class="chat-link">${escapeHtml(entry.label)}</a>`;
+    });
+
+    return html;
+  }
+
   // ── Voice Settings Persistence ───────────────────────────
   function loadVoiceSettings() {
     try {
@@ -206,7 +258,12 @@
     ws.onopen = () => {
       setStatus('connected');
       reconnectAttempts = 0;
-      ws.send(JSON.stringify({ type: 'auth', username }));
+      if (pendingSsoToken) {
+        ws.send(JSON.stringify({ type: 'sso_auth', token: pendingSsoToken }));
+        pendingSsoToken = null;
+      } else {
+        ws.send(JSON.stringify({ type: 'auth', username }));
+      }
     };
 
     ws.onmessage = (ev) => {
@@ -276,11 +333,28 @@
         profileDisplayName.value = username;
         switchToChat();
         addActivityMessage(`Connected as ${username}`);
+        window._chatUsername = username;
         send({ type: 'get_history', channelId: currentChannelId, limit: 50 });
         send({ type: 'join_channel', channelId: currentChannelId });
+        send({ type: 'get_notifications', limit: 50 });
         startPolling();
         // Load our avatar
         loadMyAvatar();
+        // Load DM conversations
+        loadDMConversations();
+        // Register push notifications
+        registerPushNotifications();
+        break;
+
+      case 'auth_error':
+        // SSO token was invalid/expired — show login screen with error
+        switchToLogin();
+        showError(msg.message || 'Authentication failed');
+        // Clean URL token param
+        if (window.history.replaceState) {
+          const cleanUrl = window.location.pathname;
+          window.history.replaceState({}, '', cleanUrl);
+        }
         break;
 
       case 'server_state':
@@ -363,6 +437,10 @@
         addChatMessage(msg);
         break;
 
+      case 'image':
+        addChatMessage(msg);
+        break;
+
       case 'history': {
         if (msg.messages && msg.messages.length > 0) {
           const newMsgs = msg.messages.filter(m => {
@@ -370,7 +448,6 @@
             const text = m.content || m.text || '';
             const key = m.id ? String(m.id) : dedupKey(name, text);
             if (seenMessageIds.has(key)) return false;
-            seenMessageIds.add(key);
             return true;
           });
           if (newMsgs.length > 0 && !msg._isRefresh) {
@@ -384,13 +461,29 @@
               return (a.id || 0) - (b.id || 0);
             })
             .forEach(m => {
-              addChatMessage({
+              const histMsg = {
+                id: m.id || null,
                 username: m.senderName || m.username || 'Unknown',
                 text: m.content || m.text || '',
                 timestamp: m.createdAt || m.sentAt || m.timestamp || new Date().toISOString(),
                 source: 'history',
-              }, true);
+                messageType: m.messageType || 'TEXT',
+              };
+              // Attach image metadata if present
+              if (m.attachment) {
+                histMsg.type = 'image';
+                histMsg.attachment = m.attachment;
+                histMsg.caption = m.content || m.text || '';
+                histMsg.text = histMsg.caption; // keep text for dedup
+              }
+              addChatMessage(histMsg, true);
             });
+
+          // Load reactions for all history messages that have IDs
+          const historyIds = newMsgs.filter(m => m.id).map(m => m.id);
+          if (historyIds.length > 0) {
+            send({ type: 'get_reactions_batch', messageIds: historyIds });
+          }
         }
         if (!msg._isRefresh) scrollToBottom();
         break;
@@ -436,6 +529,47 @@
           renderMembers();
           renderChannels();
         }
+        break;
+
+      case 'typing':
+        handleTypingIndicator(msg);
+        break;
+
+      case 'notification':
+        handleNotification(msg.notification);
+        break;
+
+      case 'notifications':
+        handleNotificationsList(msg);
+        break;
+
+      case 'notifications_updated':
+        // Re-fetch notifications after mark-read
+        send({ type: 'get_notifications', limit: 50 });
+        break;
+
+      case 'reaction_update':
+        handleReactionUpdate(msg);
+        break;
+
+      // ── DM events ──
+      case 'dm_message':
+        handleDMMessage(msg);
+        break;
+      case 'dm_history':
+        handleDMHistory(msg);
+        break;
+      case 'dm_conversations_list':
+        handleDMConversationsList(msg);
+        break;
+      case 'dm_opened':
+        handleDMOpened(msg);
+        break;
+      case 'dm_unread_counts':
+        handleDMUnreadCounts(msg);
+        break;
+      case 'dm_unread_update':
+        handleDMUnreadUpdate(msg);
         break;
 
       default:
@@ -658,6 +792,12 @@
         ${status ? `<div class="member-item-status">${escapeHtml(status)}</div>` : ''}
       </div>
     `;
+    // Click to open DM (except with yourself)
+    if (name.toLowerCase() !== (username || '').toLowerCase()) {
+      div.style.cursor = 'pointer';
+      div.title = `Message ${name}`;
+      div.addEventListener('click', () => openDMWith(name));
+    }
     memberListContent.appendChild(div);
   }
 
@@ -666,6 +806,7 @@
 
   function joinChannel(chId) {
     currentChannelId = chId;
+    activeDMConversationId = null; // Exit DM mode
     lastMessageAuthor = null;
     lastMessageTime = 0;
 
@@ -688,6 +829,7 @@
     send({ type: 'join_channel', channelId: chId });
     updateChannelHeader();
     renderChannels();
+    renderDMList();
     messagesEl.innerHTML = '';
     seenMessageIds.clear();
     send({ type: 'get_history', channelId: chId, limit: 50 });
@@ -719,7 +861,8 @@
   }
 
   function addChatMessage(msg, isHistory) {
-    const key = msg.id ? String(msg.id) : dedupKey(msg.username, msg.text);
+    const dedupText = msg.text || msg.content || msg.caption || '';
+    const key = msg.id ? String(msg.id) : dedupKey(msg.username, dedupText);
 
     if (msg.source === 'self') {
       // Self-sent messages always display — the user explicitly typed them.
@@ -733,13 +876,57 @@
     const author = msg.username || 'Unknown';
     const time = msg.timestamp || new Date().toISOString();
     const timeMs = new Date(time).getTime();
-    const cleanText = stripHtml(msg.text || '');
+    const cleanText = stripHtml(msg.text || msg.content || msg.caption || '');
+    const isImageMsg = msg.type === 'image' || msg.messageType === 'IMAGE' || msg.messageType === 'GIF';
+
+    // Build the content HTML
+    let contentHtml = '';
+
+    // Text content (rendered with rich formatting)
+    if (cleanText) {
+      const richHtml = window.RichTextRenderer
+        ? window.RichTextRenderer.renderRichText(cleanText, msg.html)
+        : formatMessageContent(cleanText);
+      contentHtml += `<div class="message-text">${richHtml}</div>`;
+    }
+
+    // Image/GIF attachment
+    if (isImageMsg) {
+      const att = msg.attachment || msg;
+      const imgUrl = att.thumbnailUrl || att.fileUrl || att.url;
+      const fullUrl = att.fileUrl || att.url || imgUrl;
+      if (imgUrl) {
+        const maxW = 400;
+        const w = att.width ? Math.min(att.width, maxW) : maxW;
+        const h = (att.height && att.width) ? Math.round((w / att.width) * att.height) : 'auto';
+        const isGif = att.mimeType === 'image/gif' || msg.messageType === 'GIF';
+        contentHtml += `
+          <div class="message-attachment">
+            <img src="${imgUrl}" alt="${escapeHtml(att.originalFilename || 'image')}"
+                 class="chat-image${isGif ? ' chat-gif' : ''}"
+                 style="max-width:${w}px;${h !== 'auto' ? ' height:' + h + 'px;' : ''}"
+                 loading="lazy"
+                 onclick="window.open('${fullUrl || imgUrl}','_blank')"
+                 onerror="this.style.display='none'">
+            ${att.originalFilename ? `<div class="attachment-filename">${escapeHtml(att.originalFilename)}</div>` : ''}
+          </div>
+        `;
+      }
+    }
+
+    // Fallback: if no content at all, show a placeholder
+    if (!contentHtml) {
+      contentHtml = '<div class="message-text"><em>(empty message)</em></div>';
+    }
 
     // Group: same author within 7 minutes = compact message
     const showHeader = (author !== lastMessageAuthor || (timeMs - lastMessageTime) > 7 * 60 * 1000);
+    const msgId = msg.id ? String(msg.id) : key;
+    const reactionsHtml = `<div class="reactions-row" data-reactions-for="${escapeHtml(msgId)}"><button class="reaction-add-btn" title="Add reaction" onclick="document.dispatchEvent(new CustomEvent('reaction:open-picker',{detail:{messageId:'${escapeHtml(msgId)}'}}))">+</button></div>`;
 
     const div = document.createElement('div');
     div.className = 'message' + (showHeader ? ' has-header' : '');
+    div.dataset.messageId = msgId;
 
     if (showHeader) {
       div.innerHTML = `
@@ -749,14 +936,16 @@
             <span class="message-author">${escapeHtml(author)}</span>
             <span class="message-timestamp">${formatTime(time)}</span>
           </div>
-          <div class="message-text">${escapeHtml(cleanText)}</div>
+          ${contentHtml}
+          ${reactionsHtml}
         </div>
       `;
     } else {
       div.innerHTML = `
         <div class="message-avatar"></div>
         <div class="message-body">
-          <div class="message-text">${escapeHtml(cleanText)}</div>
+          ${contentHtml}
+          ${reactionsHtml}
         </div>
       `;
     }
@@ -794,20 +983,397 @@
     }
   }
 
-  // ── Send Message ─────────────────────────────────────────
+  // ── Send Message (defined in DM section below) ───────────
+
+  // ── Typing Indicator ─────────────────────────────────────
+  let typingTimeout = null;
+  let lastTypingSent = 0;
+  const TYPING_THROTTLE = 3000;
+  const TYPING_STOP_DELAY = 4000;
+  const activeTypers = new Map(); // username -> timeout
+
+  function sendTypingStart() {
+    const now = Date.now();
+    if (now - lastTypingSent < TYPING_THROTTLE) return;
+    lastTypingSent = now;
+    send({ type: 'typing_start', channelId: currentChannelId });
+
+    clearTimeout(typingTimeout);
+    typingTimeout = setTimeout(sendTypingStop, TYPING_STOP_DELAY);
+  }
+
+  function sendTypingStop() {
+    clearTimeout(typingTimeout);
+    typingTimeout = null;
+    lastTypingSent = 0;
+    send({ type: 'typing_stop', channelId: currentChannelId });
+  }
+
+  function handleTypingIndicator(msg) {
+    if (msg.username === username) return; // ignore own typing
+    if (msg.channelId !== currentChannelId) return; // only show for current channel
+
+    if (msg.typing) {
+      // Clear existing timeout for this user
+      if (activeTypers.has(msg.username)) {
+        clearTimeout(activeTypers.get(msg.username));
+      }
+      // Auto-expire after 9s (slightly longer than server's 8s)
+      const timeout = setTimeout(() => {
+        activeTypers.delete(msg.username);
+        renderTypingIndicator();
+      }, 9000);
+      activeTypers.set(msg.username, timeout);
+    } else {
+      if (activeTypers.has(msg.username)) {
+        clearTimeout(activeTypers.get(msg.username));
+        activeTypers.delete(msg.username);
+      }
+    }
+    renderTypingIndicator();
+  }
+
+  function renderTypingIndicator() {
+    const el = document.getElementById('typing-indicator');
+    if (!el) return;
+
+    const typers = Array.from(activeTypers.keys());
+    if (typers.length === 0) {
+      el.textContent = '';
+      el.classList.remove('visible');
+      return;
+    }
+
+    let text;
+    if (typers.length === 1) {
+      text = `${typers[0]} is typing...`;
+    } else if (typers.length === 2) {
+      text = `${typers[0]} and ${typers[1]} are typing...`;
+    } else {
+      text = `${typers[0]} and ${typers.length - 1} others are typing...`;
+    }
+    el.textContent = text;
+    el.classList.add('visible');
+  }
+
+  // ── @Mentions ────────────────────────────────────────────
+  // Expose username for EmojiReactions component
+  window._chatUsername = '';
+
+  let mentionStartIndex = -1;
+
+  messageInput.addEventListener('input', function () {
+    window._chatUsername = username;
+    const val = this.value;
+    const cursorPos = this.selectionStart;
+
+    // Check if we're in an @mention
+    const beforeCursor = val.slice(0, cursorPos);
+    const atMatch = beforeCursor.match(/@(\w*)$/);
+
+    if (atMatch) {
+      mentionStartIndex = cursorPos - atMatch[0].length;
+      const partial = atMatch[1];
+      // Build user list from connected users + webClients
+      const userList = [];
+      const seen = new Set();
+      for (const [, u] of users) {
+        if (u.name && !seen.has(u.name.toLowerCase())) {
+          seen.add(u.name.toLowerCase());
+          userList.push({ username: u.name });
+        }
+      }
+      for (const [, wc] of webClients) {
+        if (wc.username && !seen.has(wc.username.toLowerCase())) {
+          seen.add(wc.username.toLowerCase());
+          userList.push({ username: wc.username });
+        }
+      }
+      document.dispatchEvent(new CustomEvent('mention:autocomplete', {
+        detail: { partial, userList },
+      }));
+    } else {
+      mentionStartIndex = -1;
+      document.dispatchEvent(new CustomEvent('mention:close'));
+    }
+  });
+
+  // Handle mention selection from autocomplete
+  document.addEventListener('mention:selected', function (e) {
+    const selected = e.detail.username;
+    if (mentionStartIndex >= 0) {
+      const val = messageInput.value;
+      const before = val.slice(0, mentionStartIndex);
+      const after = val.slice(messageInput.selectionStart);
+      messageInput.value = before + '@' + selected + ' ' + after;
+      const newPos = mentionStartIndex + selected.length + 2; // +2 for @ and space
+      messageInput.setSelectionRange(newPos, newPos);
+      messageInput.focus();
+      mentionStartIndex = -1;
+    }
+  });
+
+  // ── Notifications ────────────────────────────────────────
+  let unreadNotifCount = 0;
+
+  function handleNotification(notif) {
+    if (!notif) return;
+    unreadNotifCount++;
+    // Dispatch to React toast component
+    document.dispatchEvent(new CustomEvent('feature:notification', { detail: notif }));
+    // Play notification sound
+    try {
+      const audio = new Audio('data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAB/f39/');
+      audio.volume = 0.3;
+      audio.play().catch(() => {});
+    } catch (_) {}
+  }
+
+  function handleNotificationsList(msg) {
+    unreadNotifCount = msg.unreadCount || 0;
+  }
+
+  // ── Emoji Reactions ──────────────────────────────────────
+  function handleReactionUpdate(msg) {
+    document.dispatchEvent(new CustomEvent('reaction:update', {
+      detail: { messageId: String(msg.messageId), reactions: msg.reactions || [] },
+    }));
+  }
+
+  // Listen for reaction add/remove from React component
+  document.addEventListener('reaction:add', function (e) {
+    const { messageId, emoji } = e.detail;
+    send({ type: 'reaction_add', messageId, emoji, channelId: currentChannelId });
+  });
+
+  document.addEventListener('reaction:remove', function (e) {
+    const { messageId, emoji } = e.detail;
+    send({ type: 'reaction_remove', messageId, emoji, channelId: currentChannelId });
+  });
+
+  // ── Direct Messages ──────────────────────────────────────
+  const dmListEl = document.getElementById('dm-list');
+
+  function handleDMMessage(msg) {
+    // If we're currently viewing this DM conversation, show the message
+    if (activeDMConversationId === msg.conversationId) {
+      addChatMessage({
+        id: msg.id,
+        username: msg.fromUsername,
+        text: msg.content,
+        timestamp: msg.timestamp,
+      });
+    }
+    // Update the conversation's last message in the sidebar
+    updateDMListItem(msg.conversationId, msg.fromUsername, msg.content);
+  }
+
+  function handleDMHistory(msg) {
+    if (msg.conversationId !== activeDMConversationId) return;
+    if (!msg.messages || msg.messages.length === 0) return;
+
+    msg.messages
+      .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
+      .forEach(m => {
+        addChatMessage({
+          id: m.id,
+          username: m.fromUsername,
+          text: m.content,
+          timestamp: m.timestamp,
+          source: 'history',
+          messageType: m.messageType,
+          attachment: m.attachment,
+          type: m.attachment ? 'image' : undefined,
+        }, true);
+      });
+    scrollToBottom();
+  }
+
+  function handleDMConversationsList(msg) {
+    dmConversations = msg.conversations || [];
+    renderDMList();
+  }
+
+  // Track unread counts per conversation
+  const dmUnreadCounts = {};
+
+  function handleDMUnreadCounts(msg) {
+    if (msg.unreads) {
+      msg.unreads.forEach(u => { dmUnreadCounts[u.conversationId] = u.unreadCount; });
+      renderDMList();
+    }
+  }
+
+  function handleDMUnreadUpdate(msg) {
+    dmUnreadCounts[msg.conversationId] = msg.unreadCount;
+    renderDMList();
+  }
+
+  function handleDMOpened(msg) {
+    activeDMConversationId = msg.conversationId;
+    // Add to conversations list if not already there
+    if (!dmConversations.find(c => c.id === msg.conversationId)) {
+      dmConversations.unshift({
+        id: msg.conversationId,
+        otherUsername: msg.otherUsername,
+        otherUserId: msg.otherUserId,
+      });
+    }
+    joinDMConversation(msg.conversationId, msg.otherUsername);
+  }
+
+  function renderDMList() {
+    if (!dmListEl) return;
+    dmListEl.innerHTML = '';
+
+    dmConversations.forEach(conv => {
+      const unread = dmUnreadCounts[conv.id] || 0;
+      const item = document.createElement('div');
+      item.className = 'dm-item' + (activeDMConversationId === conv.id ? ' active' : '') + (unread > 0 ? ' has-unread' : '');
+      item.innerHTML = `
+        <img class="avatar avatar-sm" src="${getAvatarUrl(conv.otherUsername)}" alt="">
+        <span class="dm-username">${escapeHtml(conv.otherUsername)}</span>
+        ${unread > 0 ? `<span class="dm-unread-badge">${unread}</span>` : ''}
+      `;
+      item.addEventListener('click', () => joinDMConversation(conv.id, conv.otherUsername));
+      dmListEl.appendChild(item);
+    });
+  }
+
+  function updateDMListItem(convId, fromUsername, content) {
+    // Move this conversation to top of list
+    const idx = dmConversations.findIndex(c => c.id === convId);
+    if (idx > 0) {
+      const [conv] = dmConversations.splice(idx, 1);
+      dmConversations.unshift(conv);
+      renderDMList();
+    }
+  }
+
+  function joinDMConversation(convId, otherUsername) {
+    activeDMConversationId = convId;
+    currentChannelId = null; // Not in a channel
+
+    // Clear unread badge
+    delete dmUnreadCounts[convId];
+    send({ type: 'dm_mark_read', conversationId: convId });
+
+    // Update UI
+    channelHeader.textContent = otherUsername;
+    channelHash.textContent = '@';
+    messageInput.placeholder = `Message @${otherUsername}`;
+    messageInput.disabled = false;
+    sendBtn.disabled = false;
+
+    // Clear messages and load DM history
+    messagesEl.innerHTML = '';
+    seenMessageIds.clear();
+    lastMessageAuthor = null;
+    lastMessageTime = 0;
+
+    send({ type: 'dm_history', conversationId: convId, limit: 50 });
+    renderChannels();
+    renderDMList();
+    stopPolling();
+    sidebar.classList.remove('open');
+  }
+
+  function openDMWith(targetUsername) {
+    send({ type: 'dm_open', username: targetUsername });
+  }
+
+  // Send message — handles both DM and channel modes
   function sendMessage() {
     const text = messageInput.value.trim();
     if (!text) return;
 
+    if (activeDMConversationId) {
+      // Find the other username from active conversation
+      const conv = dmConversations.find(c => c.id === activeDMConversationId);
+      const toUsername = conv ? conv.otherUsername : null;
+      if (toUsername) {
+        send({ type: 'dm_send', toUsername, content: text, conversationId: activeDMConversationId });
+        messageInput.value = '';
+        messageInput.focus();
+        sendTypingStop();
+        return;
+      }
+    }
+
+    // Normal channel message
+    if (!text) return;
     if (text.startsWith('!')) {
       const parts = text.slice(1).split(/\s+/);
       send({ type: 'command', command: parts[0], args: parts.slice(1) });
     }
-
-    addChatMessage({ username, text, timestamp: new Date().toISOString(), source: 'self' });
     send({ type: 'text', text, channelId: currentChannelId });
     messageInput.value = '';
     messageInput.focus();
+    sendTypingStop();
+  }
+
+  // Request DM conversations on auth
+  function loadDMConversations() {
+    send({ type: 'dm_conversations' });
+  }
+
+  // ── Push Notifications ───────────────────────────────────
+  async function registerPushNotifications() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+
+    try {
+      const reg = await navigator.serviceWorker.register('/sw.js');
+      await navigator.serviceWorker.ready;
+
+      // Check if already subscribed
+      let subscription = await reg.pushManager.getSubscription();
+      if (subscription) {
+        // Already subscribed, just make sure server knows
+        send({
+          type: 'push_subscribe',
+          subscription: subscription.toJSON(),
+          userAgent: navigator.userAgent,
+        });
+        return;
+      }
+
+      // Request permission
+      const permission = await Notification.requestPermission();
+      if (permission !== 'granted') return;
+
+      // Get VAPID key from bridge (which proxies to Lexicon)
+      const vapidRes = await fetch('/api/push/vapid-key');
+      if (!vapidRes.ok) return;
+      const { publicKey } = await vapidRes.json();
+      if (!publicKey) return;
+
+      // Convert VAPID key
+      const applicationServerKey = urlBase64ToUint8Array(publicKey);
+
+      // Subscribe
+      subscription = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey,
+      });
+
+      // Send subscription to bridge → Lexicon
+      send({
+        type: 'push_subscribe',
+        subscription: subscription.toJSON(),
+        userAgent: navigator.userAgent,
+      });
+    } catch (err) {
+      console.warn('[Push] Registration failed:', err.message);
+    }
+  }
+
+  function urlBase64ToUint8Array(base64String) {
+    const padding = '='.repeat((4 - base64String.length % 4) % 4);
+    const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+    const rawData = atob(base64);
+    const outputArray = new Uint8Array(rawData.length);
+    for (let i = 0; i < rawData.length; ++i) outputArray[i] = rawData.charCodeAt(i);
+    return outputArray;
   }
 
   // ── Avatar upload ────────────────────────────────────────
@@ -870,6 +1436,107 @@
         send({ type: 'avatar_changed', avatarUrl: DEFAULT_AVATAR });
       }
     } catch (e) { console.error('[Avatar] Remove error:', e); }
+  }
+
+  // ── Chat File Upload ─────────────────────────────────────
+  const chatFileUpload = document.getElementById('chat-file-upload');
+  const MAX_CHAT_FILE_SIZE = 8 * 1024 * 1024; // 8MB
+  const ALLOWED_CHAT_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+
+  async function handleChatFileUpload(file) {
+    if (!file) return;
+    if (!ALLOWED_CHAT_TYPES.includes(file.type)) {
+      alert('Only images are supported (JPEG, PNG, GIF, WebP)');
+      return;
+    }
+    if (file.size > MAX_CHAT_FILE_SIZE) {
+      alert('File too large. Max 8MB.');
+      return;
+    }
+
+    try {
+      addSystemMessage('Uploading image...');
+
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('username', username);
+      formData.append('userId', String(userId));
+      formData.append('channelId', String(currentChannelId));
+
+      const res = await fetch('/api/chat/upload', { method: 'POST', body: formData });
+      if (!res.ok) {
+        const errBody = await res.text();
+        throw new Error(errBody || ('Upload failed: ' + res.status));
+      }
+
+      const data = await res.json();
+      const caption = messageInput.value.trim();
+
+      // Send image message via WebSocket
+      send({
+        type: 'image',
+        channelId: currentChannelId,
+        fileId: data.id,
+        fileUrl: data.url,
+        thumbnailUrl: data.thumbnailUrl,
+        originalFilename: data.originalFilename,
+        mimeType: data.mimeType,
+        width: data.width,
+        height: data.height,
+        isGif: data.mimeType === 'image/gif',
+        caption,
+      });
+
+      messageInput.value = '';
+    } catch (err) {
+      addSystemMessage('Upload failed: ' + err.message);
+    }
+  }
+
+  if (chatFileUpload) {
+    chatFileUpload.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      handleChatFileUpload(file);
+      chatFileUpload.value = ''; // reset
+    });
+  }
+
+  // Paste image from clipboard
+  messageInput.addEventListener('paste', (e) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (const item of items) {
+      if (item.type.startsWith('image/')) {
+        e.preventDefault();
+        const file = item.getAsFile();
+        if (file) handleChatFileUpload(file);
+        return;
+      }
+    }
+  });
+
+  // Drag-and-drop images onto the message area
+  if (msgContainer) {
+    msgContainer.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      msgContainer.classList.add('drag-over');
+    });
+    msgContainer.addEventListener('dragleave', (e) => {
+      e.preventDefault();
+      msgContainer.classList.remove('drag-over');
+    });
+    msgContainer.addEventListener('drop', (e) => {
+      e.preventDefault();
+      msgContainer.classList.remove('drag-over');
+      const files = e.dataTransfer?.files;
+      if (files && files.length > 0) {
+        const file = files[0];
+        if (file.type.startsWith('image/')) {
+          handleChatFileUpload(file);
+        }
+      }
+    });
   }
 
   // ── Settings Modal ───────────────────────────────────────
@@ -984,6 +1651,9 @@
   messageInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
   });
+  messageInput.addEventListener('input', () => {
+    if (messageInput.value.trim().length > 0) sendTypingStart();
+  });
 
   // Sidebar toggle (mobile)
   toggleSidebar.addEventListener('click', () => sidebar.classList.toggle('open'));
@@ -992,6 +1662,7 @@
   membersToggle.addEventListener('click', () => {
     memberListVisible = !memberListVisible;
     memberList.classList.toggle('hidden-panel', !memberListVisible);
+    memberList.classList.toggle('mobile-open', memberListVisible);
     membersToggle.classList.toggle('active', memberListVisible);
   });
 
@@ -1352,5 +2023,20 @@
   });
   muteBtn.addEventListener('click', toggleMute);
   deafenBtn.addEventListener('click', toggleDeafen);
+
+  // ── SSO Auto-Login ─────────────────────────────────────
+  // If page loaded with ?token=..., auto-authenticate via SSO
+  (function checkSsoToken() {
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get('token');
+    if (token) {
+      // Clean the token from the URL immediately (so it's not leaked in history/referrer)
+      if (window.history.replaceState) {
+        window.history.replaceState({}, '', window.location.pathname);
+      }
+      pendingSsoToken = token;
+      connect();
+    }
+  })();
 
 })();

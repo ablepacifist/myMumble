@@ -38,10 +38,11 @@ let decoderCleanupInterval = null;
 
 // ── Default Config ──
 const DEFAULT_CONFIG = {
-  mumbleHost: 'group-wildness.gl.at.ply.gg',
-  mumblePort: 58938,
-  lexiconUrl: 'http://147.185.221.24:15856',
+  mumbleHost: '127.0.0.1',
+  mumblePort: 64738,
+  lexiconUrl: 'https://api.alex-dyakin.com',
   bridgeUrl: 'https://voice.alex-dyakin.com',
+  bridgeWsUrl: 'wss://voice.alex-dyakin.com',
   superUsers: ['alex'],
 };
 
@@ -191,9 +192,90 @@ ipcMain.handle('mumble:connect', async (_event, { host, port, username }) => {
   try {
     await mumble.connect();
     startMixer();
+    connectBridge(username);
     return { success: true, session: mumble.session };
   } catch (err) {
     return { success: false, error: err.message };
+  }
+});
+
+// ── Bridge WebSocket Connection ──
+// Connects to the bridge WS for features: DMs, reactions, typing, image messages
+const WebSocket = require('ws');
+let bridgeWs = null;
+let bridgeReconnectTimer = null;
+
+function connectBridge(username) {
+  if (bridgeWs) {
+    bridgeWs.close();
+    bridgeWs = null;
+  }
+
+  const wsUrl = store.get('bridgeWsUrl', DEFAULT_CONFIG.bridgeWsUrl);
+  try {
+    bridgeWs = new WebSocket(wsUrl);
+  } catch (err) {
+    console.error('[Bridge WS] Connection failed:', err.message);
+    return;
+  }
+
+  bridgeWs.on('open', () => {
+    console.log('[Bridge WS] Connected');
+    // Authenticate with the bridge
+    bridgeWs.send(JSON.stringify({ type: 'auth', username, password: username }));
+  });
+
+  bridgeWs.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      switch (msg.type) {
+        case 'auth_ok':
+          console.log('[Bridge WS] Authenticated');
+          // Request DM conversations
+          bridgeWs.send(JSON.stringify({ type: 'dm_conversations' }));
+          break;
+        case 'dm_message':
+        case 'dm_history':
+        case 'dm_conversations_list':
+        case 'dm_opened':
+        case 'reaction_update':
+        case 'notification':
+        case 'notifications':
+        case 'user_typing':
+          // Forward to renderer
+          send('bridge:message', msg);
+          break;
+        // Ignore text/image that come through bridge (we get those from Mumble directly)
+        default:
+          break;
+      }
+    } catch (_) {}
+  });
+
+  bridgeWs.on('close', () => {
+    console.log('[Bridge WS] Disconnected');
+    bridgeWs = null;
+    // Reconnect after 5 seconds
+    if (bridgeReconnectTimer) clearTimeout(bridgeReconnectTimer);
+    bridgeReconnectTimer = setTimeout(() => {
+      if (currentUser) connectBridge(currentUser.username || username);
+    }, 5000);
+  });
+
+  bridgeWs.on('error', (err) => {
+    console.error('[Bridge WS] Error:', err.message);
+  });
+}
+
+function disconnectBridge() {
+  if (bridgeReconnectTimer) { clearTimeout(bridgeReconnectTimer); bridgeReconnectTimer = null; }
+  if (bridgeWs) { bridgeWs.close(); bridgeWs = null; }
+}
+
+// IPC: Send message to bridge WS
+ipcMain.on('bridge:send', (_event, msg) => {
+  if (bridgeWs && bridgeWs.readyState === WebSocket.OPEN) {
+    bridgeWs.send(JSON.stringify(msg));
   }
 });
 
@@ -202,6 +284,7 @@ ipcMain.on('mumble:disconnect', () => {
     mumble.disconnect();
     mumble = null;
   }
+  disconnectBridge();
   stopMixer();
   currentUser = null;
 });

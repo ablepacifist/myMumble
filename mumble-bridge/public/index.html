@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>IDIOTS PLAY GAMES — Voice Chat</title>
   <link rel="stylesheet" href="/css/style.css?v=3">
+  <link rel="stylesheet" href="/react/style.css?v=1" onerror="">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 </head>
@@ -36,6 +37,14 @@
 
       <!-- Channel List (Discord-style with categories) -->
       <div class="channel-tree" id="channel-tree"></div>
+
+      <!-- Direct Messages Section -->
+      <div class="dm-section" id="dm-section">
+        <div class="dm-header">
+          <span class="dm-header-label">DIRECT MESSAGES</span>
+        </div>
+        <div class="dm-list" id="dm-list"></div>
+      </div>
 
       <!-- Channel Create Dialog -->
       <div id="channel-dialog" class="sidebar-dialog hidden">
@@ -101,8 +110,15 @@
           </div>
 
           <!-- Input Bar -->
+          <div id="typing-indicator"></div>
+          <div id="typing-indicator-mount"></div>
           <div id="input-bar">
-            <div class="input-wrapper">
+            <div class="input-wrapper" style="position:relative;">
+              <div id="mention-autocomplete-mount"></div>
+              <label class="attach-btn" for="chat-file-upload" title="Upload image or GIF">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
+              </label>
+              <input type="file" id="chat-file-upload" accept="image/jpeg,image/png,image/gif,image/webp" hidden>
               <input type="text" id="message-input" placeholder="Message #general" autocomplete="off" maxlength="2000" disabled>
               <button id="send-btn" class="btn btn-primary" disabled>
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
@@ -217,7 +233,11 @@
       </div>
     </div>
   </div>
-
+    <!-- React feature mount points -->
+    <div id="notification-toast-mount"></div>
+    <div id="reactions-mount"></div>
+  <script src="/js/rich-text-renderer.js?v=1"></script>
   <script src="/js/chat.js?v=3"></script>
+  <script src="/react/features-bundle.js?v=2" defer onerror=""></script>
 </body>
 </html>

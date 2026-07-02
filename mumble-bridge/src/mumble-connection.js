@@ -85,6 +85,13 @@ class MumbleConnection extends EventEmitter {
    */
   connect(username, password) {
     return new Promise((resolve, reject) => {
+      // Clean up any existing socket before reconnecting
+      if (this.socket) {
+        this.socket.removeAllListeners();
+        this.socket.destroy();
+        this.socket = null;
+      }
+
       this.socket = tls.connect(
         {
           host: config.mumble.host,
@@ -94,6 +101,10 @@ class MumbleConnection extends EventEmitter {
         () => {
           console.log(`[Mumble] TLS connected to ${config.mumble.host}:${config.mumble.port}`);
           this.connected = true;
+
+          // Enable TCP keepalive to prevent idle disconnect
+          this.socket.setKeepAlive(true, 10000);
+          this.socket.setNoDelay(true);
 
           // Send Version message
           this.sendMessage('Version', {
@@ -108,6 +119,9 @@ class MumbleConnection extends EventEmitter {
           if (password) authMsg.password = password;
           this.sendMessage('Authenticate', authMsg);
 
+          // Send immediate ping to prevent timeout
+          this.sendMessage('Ping', { timestamp: Date.now() });
+
           resolve();
         }
       );
@@ -119,8 +133,11 @@ class MumbleConnection extends EventEmitter {
         this.emit('error', err);
         reject(err);
       });
-      this.socket.on('close', () => {
-        console.log('[Mumble] Connection closed');
+      this.socket.on('end', () => {
+        console.log('[Mumble] Socket received END (server initiated close)');
+      });
+      this.socket.on('close', (hadError) => {
+        console.log(`[Mumble] Connection closed${hadError ? ' (with error)' : ''} | destroyed=${this.socket?.destroyed} | readableEnded=${this.socket?.readableEnded}`);
         this.connected = false;
         this.emit('disconnected');
       });
@@ -131,18 +148,22 @@ class MumbleConnection extends EventEmitter {
    * Handle incoming TCP data (buffered framing).
    */
   _onData(data) {
-    this.buffer = Buffer.concat([this.buffer, data]);
+    try {
+      this.buffer = Buffer.concat([this.buffer, data]);
 
-    while (this.buffer.length >= 6) {
-      const typeId = this.buffer.readUInt16BE(0);
-      const length = this.buffer.readUInt32BE(2);
+      while (this.buffer.length >= 6) {
+        const typeId = this.buffer.readUInt16BE(0);
+        const length = this.buffer.readUInt32BE(2);
 
-      if (this.buffer.length < 6 + length) break; // Not enough data yet
+        if (this.buffer.length < 6 + length) break; // Not enough data yet
 
-      const payload = this.buffer.slice(6, 6 + length);
-      this.buffer = this.buffer.slice(6 + length);
+        const payload = this.buffer.slice(6, 6 + length);
+        this.buffer = this.buffer.slice(6 + length);
 
-      this._handleMessage(typeId, payload);
+        this._handleMessage(typeId, payload);
+      }
+    } catch (err) {
+      console.error('[Mumble] Data parsing error:', err.message);
     }
   }
 
@@ -152,6 +173,11 @@ class MumbleConnection extends EventEmitter {
   _handleMessage(typeId, payload) {
     const typeName = this.MESSAGE_TYPE_MAP[typeId];
     if (!typeName) return;
+
+    // Temporary debug: log all non-audio messages
+    if (typeName !== 'UDPTunnel' && typeName !== 'Ping') {
+      // console.log(`[Mumble] << ${typeName} (${payload.length}b)`);
+    }
 
     // Skip UDP tunnel (audio) for now — raw binary, not protobuf
     if (typeName === 'UDPTunnel') {
@@ -165,6 +191,11 @@ class MumbleConnection extends EventEmitter {
     try {
       const decoded = MessageType.decode(payload);
       const obj = MessageType.toObject(decoded, { longs: Number, defaults: true });
+
+      // Log UserRemove details for debugging
+      if (typeName === 'UserRemove') {
+        console.log(`[Mumble] UserRemove: session=${obj.session} reason="${obj.reason}"`);
+      }
       this.emit('message', typeName, obj);
       this.emit(typeName, obj); // Also emit by specific type name
     } catch (err) {

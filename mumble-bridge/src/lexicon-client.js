@@ -9,6 +9,24 @@ class LexiconClient {
   constructor() {
     this.baseUrl = config.lexicon.apiUrl;
     this.sessions = new Map(); // userId -> JSESSIONID cookie
+    this.requestTimeoutMs = 5000;
+  }
+
+  /**
+   * Run a promise with a timeout so bridge auth can't hang forever.
+   * @param {Promise<any>} promise
+   * @param {string} label
+   */
+  async withTimeout(promise, label) {
+    let timeoutHandle;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutHandle = setTimeout(() => reject(new Error(`${label} timed out after ${this.requestTimeoutMs}ms`)), this.requestTimeoutMs);
+    });
+    try {
+      return await Promise.race([promise, timeoutPromise]);
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
   }
 
   /**
@@ -35,11 +53,11 @@ class LexiconClient {
    * @returns {object} Login response with user info
    */
   async login(username, password) {
-    const res = await fetch(`${this.baseUrl}/api/auth/login`, {
+    const res = await this.withTimeout(fetch(`${this.baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
-    });
+    }), 'Lexicon login');
 
     if (!res.ok) {
       const err = await res.text();
@@ -73,11 +91,11 @@ class LexiconClient {
    */
   async register(username) {
     const password = 'mumble_' + Math.random().toString(36).slice(2, 14);
-    const res = await fetch(`${this.baseUrl}/api/auth/register`, {
+    const res = await this.withTimeout(fetch(`${this.baseUrl}/api/auth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password, displayName: username }),
-    });
+    }), 'Lexicon register');
 
     if (!res.ok) {
       const err = await res.text();
@@ -94,7 +112,14 @@ class LexiconClient {
    */
   async getOrCreateUser(username) {
     // Try to find existing user
-    let player = await this.getPlayerByUsername(username);
+    let player = null;
+    try {
+      player = await this.getPlayerByUsername(username);
+    } catch (err) {
+      console.error(`[Lexicon] Lookup failed for '${username}': ${err.message}`);
+      console.warn('[Lexicon] Continuing with local-only user profile to avoid login hang');
+      return { id: null, username, displayName: username };
+    }
     if (player) {
       console.log(`[Lexicon] Found existing user: ${username} (ID: ${player.id})`);
       return player;
@@ -239,7 +264,10 @@ class LexiconClient {
   }
 
   async getPlayerByUsername(username) {
-    const res = await fetch(`${this.baseUrl}/api/players/username/${encodeURIComponent(username)}`);
+    const res = await this.withTimeout(
+      fetch(`${this.baseUrl}/api/players/username/${encodeURIComponent(username)}`),
+      'Lexicon player lookup'
+    );
     if (!res.ok) return null;
     return res.json();
   }
@@ -306,6 +334,177 @@ class LexiconClient {
     const res = await fetch(`${this.baseUrl}/api/messages/search?q=${encodeURIComponent(query)}&channelId=${channelId}`);
     if (!res.ok) return [];
     return res.json();
+  }
+
+  // ──────────────────────────────────────
+  // Chat file upload endpoints (images/GIFs)
+  // ──────────────────────────────────────
+
+  /**
+   * Upload a chat image/GIF to Lexicon.
+   * @param {Buffer} fileBuffer - The raw file data
+   * @param {string} filename - Original filename
+   * @param {string} mimeType - MIME type (image/png, image/gif, etc.)
+   * @param {number} userId - Lexicon user ID
+   * @param {number} channelId - Channel where file is being shared
+   * @returns {object} Upload response with id, url, thumbnailUrl, dimensions
+   */
+  async uploadChatFile(fileBuffer, filename, mimeType, userId, channelId) {
+    const FormData = require('form-data');
+    const form = new FormData();
+    form.append('file', fileBuffer, { filename, contentType: mimeType });
+    form.append('userId', String(userId));
+    form.append('channelId', String(channelId));
+
+    const res = await fetch(`${this.baseUrl}/api/chat/upload`, {
+      method: 'POST',
+      body: form,
+      headers: form.getHeaders(),
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Chat file upload failed: ${res.status} - ${err}`);
+    }
+    return res.json();
+  }
+
+  /**
+   * Get the full URL for a chat file.
+   * @param {number} fileId
+   * @returns {string}
+   */
+  getChatFileUrl(fileId) {
+    return `${this.baseUrl}/api/chat/files/${fileId}`;
+  }
+
+  /**
+   * Get the thumbnail URL for a chat file.
+   * @param {number} fileId
+   * @returns {string}
+   */
+  getChatFileThumbnailUrl(fileId) {
+    return `${this.baseUrl}/api/chat/files/${fileId}/thumb`;
+  }
+
+  // ── Push Notifications ──
+
+  /**
+   * Get the VAPID public key from Lexicon.
+   * @returns {Promise<string|null>}
+   */
+  async getVapidKey() {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/push/vapid-key`);
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data.publicKey || null;
+    } catch (err) {
+      console.error(`[Lexicon] getVapidKey failed: ${err.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Register a push subscription for a user.
+   */
+  async pushSubscribe({ userId, endpoint, keys, userAgent }) {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/push/subscribe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId, endpoint, keys, userAgent }),
+      });
+      return res.ok;
+    } catch (err) {
+      console.error(`[Lexicon] pushSubscribe failed: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Unregister a push subscription.
+   */
+  async pushUnsubscribe(endpoint) {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/push/unsubscribe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ endpoint }),
+      });
+      return res.ok;
+    } catch (err) {
+      console.error(`[Lexicon] pushUnsubscribe failed: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Send a push notification to a single user.
+   */
+  async pushSend({ userId, title, body, url, data }) {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/push/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId, title, body, url, data }),
+      });
+      if (!res.ok) return false;
+      const result = await res.json();
+      return result.success && result.sent > 0;
+    } catch (err) {
+      console.error(`[Lexicon] pushSend failed: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Send a push notification to multiple users.
+   */
+  async pushSendBulk({ userIds, title, body, url, data }) {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/push/send-bulk`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userIds, title, body, url, data }),
+      });
+      if (!res.ok) return 0;
+      const result = await res.json();
+      return result.sent || 0;
+    } catch (err) {
+      console.error(`[Lexicon] pushSendBulk failed: ${err.message}`);
+      return 0;
+    }
+  }
+
+  // ── SSO Token Validation ──
+
+  /**
+   * Validate a one-time SSO token against Lexicon.
+   * Token is consumed on validation (single-use, 60s expiry).
+   * @param {string} token - The SSO token from Lexicon frontend
+   * @returns {Promise<{valid: boolean, userId?: number, username?: string, displayName?: string}>}
+   */
+  async validateSsoToken(token) {
+    try {
+      const res = await this.withTimeout(fetch(`${this.baseUrl}/api/auth/sso/validate-token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token }),
+      }), 'SSO validate-token');
+
+      if (!res.ok) {
+        const err = await res.text();
+        console.warn(`[Lexicon] SSO token validation failed: ${res.status} - ${err}`);
+        return { valid: false };
+      }
+
+      const data = await res.json();
+      return data;
+    } catch (err) {
+      console.error(`[Lexicon] SSO token validation error: ${err.message}`);
+      return { valid: false };
+    }
   }
 }
 

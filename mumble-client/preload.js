@@ -20,6 +20,9 @@ contextBridge.exposeInMainWorld('mumble', {
   getAvatar: (username) => ipcRenderer.invoke('mumble:get-avatar', username),
   getVoiceDiag: () => ipcRenderer.invoke('mumble:get-voice-diag'),
 
+  // ── Bridge WS Actions ──
+  bridgeSend: (msg) => ipcRenderer.send('bridge:send', msg),
+
   // ── Events (main → renderer) ──
   on: (channel, callback) => {
     const validChannels = [
@@ -32,6 +35,7 @@ contextBridge.exposeInMainWorld('mumble', {
       'mumble:audio-data',
       'mumble:error',
       'mumble:disconnected',
+      'bridge:message',
     ];
     if (!validChannels.includes(channel)) return () => {};
 
