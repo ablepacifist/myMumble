@@ -54,12 +54,14 @@ class NotificationsFeature {
     const key = username.toLowerCase();
     if (this.userIdCache.has(key)) return this.userIdCache.get(key);
 
+    // NOTE: userId 0 is a valid Lexicon id — use explicit null checks, never truthiness.
+
     // 1. Online web clients (no I/O)
     try {
       const clients = this.deps?.getClients?.();
       if (clients) {
         for (const [, info] of clients) {
-          if (info.authenticated && info.userId && info.username?.toLowerCase() === key) {
+          if (info.authenticated && info.userId != null && info.username?.toLowerCase() === key) {
             this.userIdCache.set(key, info.userId);
             return info.userId;
           }
@@ -73,7 +75,7 @@ class NotificationsFeature {
         'SELECT lexicon_user_id FROM user_mapping WHERE LOWER(lexicon_username) = LOWER(?)',
         [username]
       );
-      if (rows.length > 0 && rows[0].lexicon_user_id) {
+      if (rows.length > 0 && rows[0].lexicon_user_id != null) {
         this.userIdCache.set(key, rows[0].lexicon_user_id);
         return rows[0].lexicon_user_id;
       }
@@ -82,7 +84,7 @@ class NotificationsFeature {
     // 3. Lexicon API
     try {
       const player = await lexicon.getPlayerByUsername(username);
-      if (player?.id) {
+      if (player && player.id != null) {
         this.userIdCache.set(key, player.id);
         return player.id;
       }
@@ -126,7 +128,7 @@ class NotificationsFeature {
    * deliverPush=false — the mentions feature already routes OS push.
    */
   async notifyMention({ targetUserId, fromUsername, fromUserId = null, channelId, preview }) {
-    if (!targetUserId || !fromUsername) return;
+    if (targetUserId == null || !fromUsername) return;
     await lexicon.postNotification({
       targetUserId,
       type: 'mention',

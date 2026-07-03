@@ -256,12 +256,13 @@ async function handleClientMessage(ws, msg, client, ctx) {
         }).catch(err => console.error(`[Mentions] Process failed: ${err.message}`));
       }
 
-      // Forward to Lexicon app notifications (async, non-blocking)
+      // Forward to Lexicon app notifications (async, non-blocking).
+      // userId 0 is valid — use ?? so it isn't coerced to null.
       const notificationsFeature = featureRegistry.features?.get('notifications');
       if (notificationsFeature) {
         notificationsFeature.notifyMessage({
           senderName: client.username,
-          fromUserId: client.userId || null,
+          fromUserId: client.userId ?? null,
           channelId,
           channelName,
           text,
@@ -476,12 +477,13 @@ async function handleClientMessage(ws, msg, client, ctx) {
           ctx.broadcastAll({ type: 'voice_state', id: client.webClientId, username: client.username, inVoice: true, voiceChannelId: voiceChId });
         }
 
-        // Forward to Lexicon app notifications (async, non-blocking)
+        // Forward to Lexicon app notifications (async, non-blocking).
+        // userId 0 is valid — use ?? so it isn't coerced to null.
         const notifFeature = featureRegistry.features?.get('notifications');
         if (notifFeature) {
           notifFeature.notifyVoiceJoin({
             name: client.username,
-            fromUserId: client.userId || null,
+            fromUserId: client.userId ?? null,
             channelId: voiceChId || 0,
             channelName: ctx.channels.get(voiceChId)?.name,
           }).catch(() => {});

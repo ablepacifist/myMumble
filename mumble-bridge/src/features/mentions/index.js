@@ -90,7 +90,8 @@ class MentionsFeature {
       let targetWs = null;
 
       for (const [clientWs, info] of clients) {
-        if (info.authenticated && info.username && info.username.toLowerCase() === mentionedName) {
+        // NOTE: userId 0 is a valid Lexicon id — never use truthiness checks here
+        if (info.authenticated && info.userId != null && info.username && info.username.toLowerCase() === mentionedName) {
           targetUserId = info.userId;
           targetWs = clientWs;
           break;
@@ -98,18 +99,18 @@ class MentionsFeature {
       }
 
       // If not online, look up from DB
-      if (!targetUserId) {
+      if (targetUserId == null) {
         try {
           const [rows] = await pool.execute(
             'SELECT lexicon_user_id FROM user_mapping WHERE LOWER(lexicon_username) = LOWER(?)',
             [mentionedName]
           );
-          if (rows.length > 0) targetUserId = rows[0].lexicon_user_id;
+          if (rows.length > 0 && rows[0].lexicon_user_id != null) targetUserId = rows[0].lexicon_user_id;
         } catch (_) {}
       }
 
       // Store notification in DB (even if user is offline — they'll see it when they connect)
-      if (targetUserId) {
+      if (targetUserId != null) {
         try {
           const [result] = await pool.execute(
             `INSERT INTO notifications (user_id, type, from_username, channel_id, channel_name, message_id, message_preview)
@@ -144,11 +145,12 @@ class MentionsFeature {
 
           // Also surface the mention in the Lexicon app (bell/toasts).
           // deliverPush=false — OS push is already routed above.
+          // userId 0 is valid — use ?? so it isn't coerced to null.
           const notifFeature = require('../notifications');
           notifFeature.notifyMention({
             targetUserId,
             fromUsername,
-            fromUserId: fromUserId || null,
+            fromUserId: fromUserId ?? null,
             channelId,
             preview,
           }).catch(() => {});
