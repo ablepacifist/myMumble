@@ -26,7 +26,10 @@ const MAX_BODY = 140;
 class NotificationsFeature {
   constructor() {
     this.name = 'notifications';
-    this.messageTypes = []; // producer-only — no client-originated WS messages
+    // Prefs proxy: the voice UI manages its Lexicon notification preferences
+    // through the bridge (same pattern as push_subscribe) instead of calling
+    // Lexicon directly.
+    this.messageTypes = ['get_notification_prefs', 'set_notification_prefs'];
     this.deps = null;
     this.userIdCache = new Map(); // username(lower) -> lexicon user id
   }
@@ -35,8 +38,21 @@ class NotificationsFeature {
     this.deps = deps;
   }
 
-  handleMessage() {
-    // No client-originated message types.
+  handleMessage(ws, client, msg) {
+    if (!client.authenticated || client.userId == null) return;
+
+    switch (msg.type) {
+      case 'get_notification_prefs':
+        lexicon.getNotificationPrefs(client.userId)
+          .then((prefs) => ws.send(JSON.stringify({ type: 'notification_prefs', prefs })))
+          .catch(() => ws.send(JSON.stringify({ type: 'notification_prefs', prefs: null })));
+        break;
+      case 'set_notification_prefs':
+        lexicon.updateNotificationPrefs(client.userId, msg.prefs || {})
+          .then((ok) => ws.send(JSON.stringify({ type: 'notification_prefs_saved', success: ok })))
+          .catch(() => ws.send(JSON.stringify({ type: 'notification_prefs_saved', success: false })));
+        break;
+    }
   }
 
   _truncate(text) {

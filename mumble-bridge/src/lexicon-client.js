@@ -504,6 +504,37 @@ class LexiconClient {
     }
   }
 
+  /**
+   * Get a user's Lexicon notification preferences.
+   */
+  async getNotificationPrefs(userId) {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/notifications/prefs?userId=${userId}`);
+      if (!res.ok) return null;
+      return res.json();
+    } catch (err) {
+      console.error(`[Lexicon] getNotificationPrefs error: ${err.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Update a user's Lexicon notification preferences.
+   */
+  async updateNotificationPrefs(userId, prefs) {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/notifications/prefs?userId=${userId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(prefs),
+      });
+      return res.ok;
+    } catch (err) {
+      console.error(`[Lexicon] updateNotificationPrefs error: ${err.message}`);
+      return false;
+    }
+  }
+
   // ── SSO Token Validation ──
 
   /**

@@ -91,6 +91,13 @@
           <h2 id="current-channel-name">general</h2>
         </div>
         <div class="header-actions">
+          <a id="lexicon-link" class="header-btn" href="https://alex-dyakin.com/lexicon-dashboard" target="_blank" rel="noopener noreferrer" title="Back to Lexicon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
+          </a>
+          <button id="notif-btn" class="header-btn" title="Notifications" style="position:relative;">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.89 2 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>
+            <span id="notif-badge" class="notif-badge hidden">0</span>
+          </button>
           <button id="header-voice-btn" class="header-btn" title="Join voice chat">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
           </button>
@@ -99,6 +106,15 @@
           </button>
           <button id="toggle-sidebar-btn" class="header-btn mobile-only" title="Toggle sidebar">☰</button>
         </div>
+      </div>
+
+      <!-- Notification dropdown panel -->
+      <div id="notif-panel" class="notif-panel hidden">
+        <div class="notif-panel-header">
+          <span>Notifications</span>
+          <button id="notif-mark-read" class="btn btn-small">Mark all read</button>
+        </div>
+        <div id="notif-list" class="notif-list"></div>
       </div>
 
       <!-- Main content area (messages + optional member list) -->
@@ -142,6 +158,7 @@
       <div class="modal-sidebar">
         <ul class="settings-nav">
           <li class="settings-nav-item active" data-tab="profile">My Profile</li>
+          <li class="settings-nav-item" data-tab="notifications">Notifications</li>
           <li class="settings-nav-item" data-tab="voice">Voice & Audio</li>
           <li class="settings-nav-item" data-tab="appearance">Appearance</li>
           <li class="settings-nav-divider"></li>
@@ -171,6 +188,28 @@
               <input type="text" id="profile-username" class="settings-input" disabled>
             </div>
           </div>
+        </div>
+
+        <!-- Notifications Tab -->
+        <div class="settings-tab" id="tab-notifications">
+          <h2>Notifications</h2>
+          <p class="settings-hint">These control which events reach you in the Lexicon app (bell, toasts) and as browser push. Synced with your Lexicon account.</p>
+          <div class="settings-group">
+            <label class="checkbox-label"><input type="checkbox" id="notif-pref-message" checked> 💬 Text messages</label>
+          </div>
+          <div class="settings-group">
+            <label class="checkbox-label"><input type="checkbox" id="notif-pref-voice-join" checked> 🔊 Voice joins</label>
+          </div>
+          <div class="settings-group">
+            <label class="checkbox-label"><input type="checkbox" id="notif-pref-mention" checked> @ Mentions of me</label>
+          </div>
+          <div class="settings-group">
+            <label class="checkbox-label"><input type="checkbox" id="notif-pref-music"> 🎵 Now playing (music)</label>
+          </div>
+          <div class="settings-group">
+            <label class="checkbox-label"><input type="checkbox" id="notif-pref-push" checked> 🔔 Browser / OS push (works when this tab is closed)</label>
+          </div>
+          <p id="notif-prefs-status" class="settings-hint"></p>
         </div>
 
         <!-- Voice Tab -->

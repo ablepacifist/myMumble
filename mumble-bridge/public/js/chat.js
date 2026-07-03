@@ -543,6 +543,17 @@
         handleNotificationsList(msg);
         break;
 
+      case 'notification_prefs':
+        handleNotificationPrefs(msg);
+        break;
+
+      case 'notification_prefs_saved':
+        if (notifPrefsStatus) {
+          notifPrefsStatus.textContent = msg.success ? 'Saved ✓' : 'Save failed — Lexicon offline?';
+          setTimeout(() => { if (notifPrefsStatus.textContent === 'Saved ✓') notifPrefsStatus.textContent = ''; }, 2000);
+        }
+        break;
+
       case 'notifications_updated':
         // Re-fetch notifications after mark-read
         send({ type: 'get_notifications', limit: 50 });
@@ -1115,10 +1126,82 @@
 
   // ── Notifications ────────────────────────────────────────
   let unreadNotifCount = 0;
+  let notifItems = [];
+  const notifBtn = $('#notif-btn');
+  const notifBadge = $('#notif-badge');
+  const notifPanel = $('#notif-panel');
+  const notifList = $('#notif-list');
+  const notifMarkRead = $('#notif-mark-read');
+
+  function updateNotifBadge() {
+    if (!notifBadge) return;
+    if (unreadNotifCount > 0) {
+      notifBadge.textContent = unreadNotifCount > 99 ? '99+' : String(unreadNotifCount);
+      notifBadge.classList.remove('hidden');
+    } else {
+      notifBadge.classList.add('hidden');
+    }
+  }
+
+  function renderNotifList() {
+    if (!notifList) return;
+    if (notifItems.length === 0) {
+      notifList.innerHTML = '<div class="notif-empty">You\'re all caught up 🎉</div>';
+      return;
+    }
+    notifList.innerHTML = '';
+    notifItems.forEach((n) => {
+      const item = document.createElement('div');
+      item.className = 'notif-item' + (n.isRead ? '' : ' unread');
+      const when = n.createdAt ? new Date(n.createdAt).toLocaleString() : '';
+      const chan = n.channelName ? ` in #${escapeHtml(n.channelName)}` : '';
+      item.innerHTML =
+        '<span class="notif-item-icon">@</span>' +
+        '<span class="notif-item-body">' +
+          '<span class="notif-item-title">' + escapeHtml(n.fromUsername || 'Someone') + ' mentioned you' + chan + '</span>' +
+          (n.messagePreview ? '<span class="notif-item-text">' + escapeHtml(n.messagePreview) + '</span>' : '') +
+          '<span class="notif-item-time">' + escapeHtml(when) + '</span>' +
+        '</span>';
+      if (n.channelId !== null && n.channelId !== undefined) {
+        item.addEventListener('click', () => {
+          joinChannel(n.channelId);
+          notifPanel.classList.add('hidden');
+        });
+      }
+      notifList.appendChild(item);
+    });
+  }
+
+  if (notifBtn) {
+    notifBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const opening = notifPanel.classList.contains('hidden');
+      notifPanel.classList.toggle('hidden');
+      if (opening) send({ type: 'get_notifications', limit: 50 });
+    });
+    document.addEventListener('click', (e) => {
+      if (!notifPanel.classList.contains('hidden') &&
+          !notifPanel.contains(e.target) && e.target !== notifBtn) {
+        notifPanel.classList.add('hidden');
+      }
+    });
+  }
+
+  if (notifMarkRead) {
+    notifMarkRead.addEventListener('click', () => {
+      send({ type: 'notifications_read' });
+      unreadNotifCount = 0;
+      updateNotifBadge();
+    });
+  }
 
   function handleNotification(notif) {
     if (!notif) return;
     unreadNotifCount++;
+    updateNotifBadge();
+    notifItems.unshift({ ...notif, isRead: false, messagePreview: notif.messagePreview });
+    notifItems = notifItems.slice(0, 50);
+    renderNotifList();
     // Dispatch to React toast component
     document.dispatchEvent(new CustomEvent('feature:notification', { detail: notif }));
     // Play notification sound
@@ -1131,7 +1214,52 @@
 
   function handleNotificationsList(msg) {
     unreadNotifCount = msg.unreadCount || 0;
+    notifItems = msg.notifications || [];
+    updateNotifBadge();
+    renderNotifList();
   }
+
+  // ── Notification Preferences (synced with Lexicon) ───────
+  const notifPrefInputs = {
+    enableMessage: $('#notif-pref-message'),
+    enableVoiceJoin: $('#notif-pref-voice-join'),
+    enableMention: $('#notif-pref-mention'),
+    enableMusic: $('#notif-pref-music'),
+    enablePush: $('#notif-pref-push'),
+  };
+  const notifPrefsStatus = $('#notif-prefs-status');
+
+  function handleNotificationPrefs(msg) {
+    const p = msg.prefs;
+    if (!p) {
+      if (notifPrefsStatus) notifPrefsStatus.textContent = 'Could not load preferences (Lexicon offline?)';
+      return;
+    }
+    Object.keys(notifPrefInputs).forEach((key) => {
+      if (notifPrefInputs[key]) notifPrefInputs[key].checked = !!p[key];
+    });
+    if (notifPrefsStatus) notifPrefsStatus.textContent = '';
+  }
+
+  function saveNotificationPrefs() {
+    const prefs = {};
+    Object.keys(notifPrefInputs).forEach((key) => {
+      prefs[key] = notifPrefInputs[key] ? notifPrefInputs[key].checked : true;
+    });
+    send({ type: 'set_notification_prefs', prefs });
+    // Push toggle also (de)registers the browser push subscription
+    if (notifPrefInputs.enablePush) {
+      if (notifPrefInputs.enablePush.checked) {
+        registerPushNotifications();
+      } else {
+        unregisterPushNotifications();
+      }
+    }
+  }
+
+  Object.values(notifPrefInputs).forEach((input) => {
+    if (input) input.addEventListener('change', saveNotificationPrefs);
+  });
 
   // ── Emoji Reactions ──────────────────────────────────────
   function handleReactionUpdate(msg) {
@@ -1367,6 +1495,21 @@
     }
   }
 
+  async function unregisterPushNotifications() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+    try {
+      const reg = await navigator.serviceWorker.getRegistration('/sw.js');
+      if (!reg) return;
+      const subscription = await reg.pushManager.getSubscription();
+      if (!subscription) return;
+      const endpoint = subscription.endpoint;
+      await subscription.unsubscribe();
+      send({ type: 'push_unsubscribe', endpoint });
+    } catch (err) {
+      console.warn('[Push] Unregister failed:', err.message);
+    }
+  }
+
   function urlBase64ToUint8Array(base64String) {
     const padding = '='.repeat((4 - base64String.length % 4) % 4);
     const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
@@ -1545,6 +1688,7 @@
     switchSettingsTab(tab || 'profile');
     populateAudioDevices();
     syncVoiceSettingsUI();
+    send({ type: 'get_notification_prefs' });
   }
 
   function closeSettings() {

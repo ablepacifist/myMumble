@@ -308,11 +308,25 @@
     // Don't show our own messages (we already added them locally)
     if (msg.actor === mySession) return;
 
+    const cleanText = stripHtml(text);
     addChatMessage({
       username: senderName,
-      text: stripHtml(text),
+      text: cleanText,
       timestamp: new Date().toISOString(),
     });
+
+    // Desktop notification: always on @mention, otherwise only when the
+    // window is not focused (FEATURE_ROADMAP D1).
+    try {
+      const mentioned = username &&
+        new RegExp('@' + username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i').test(cleanText);
+      if (mentioned || !document.hasFocus()) {
+        const title = mentioned ? `${senderName} mentioned you` : `${senderName}`;
+        const body = cleanText.length > 140 ? cleanText.slice(0, 139) + '…' : cleanText;
+        const n = new Notification(title, { body, silent: !mentioned });
+        n.onclick = () => window.focus();
+      }
+    } catch (_) {}
   });
 
   window.mumble.on('mumble:audio-data', (data) => {
