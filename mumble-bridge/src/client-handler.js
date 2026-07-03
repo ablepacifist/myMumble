@@ -40,7 +40,7 @@ async function handleClientMessage(ws, msg, client, ctx) {
           await pool.execute(
             `INSERT INTO user_mapping (lexicon_user_id, lexicon_username, display_name)
              VALUES (?, ?, ?)
-             ON DUPLICATE KEY UPDATE display_name = VALUES(display_name), last_seen = NOW()`,
+             ON DUPLICATE KEY UPDATE lexicon_user_id = VALUES(lexicon_user_id), display_name = VALUES(display_name), last_seen = NOW()`,
             [player.id, username, client.username]
           );
         } catch (err) {
@@ -144,7 +144,7 @@ async function handleClientMessage(ws, msg, client, ctx) {
           await pool.execute(
             `INSERT INTO user_mapping (lexicon_user_id, lexicon_username, display_name)
              VALUES (?, ?, ?)
-             ON DUPLICATE KEY UPDATE display_name = VALUES(display_name), last_seen = NOW()`,
+             ON DUPLICATE KEY UPDATE lexicon_user_id = VALUES(lexicon_user_id), display_name = VALUES(display_name), last_seen = NOW()`,
             [client.userId, ssoUsername, client.username]
           );
         } catch (err) {

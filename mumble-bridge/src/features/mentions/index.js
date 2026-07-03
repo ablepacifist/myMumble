@@ -98,7 +98,14 @@ class MentionsFeature {
         }
       }
 
-      // If not online, look up from DB
+      // If not online, ask Lexicon (authoritative — user_mapping can go stale
+      // when Lexicon ids change), then fall back to the local mapping table.
+      if (targetUserId == null) {
+        try {
+          const player = await lexicon.getPlayerByUsername(mentionedName);
+          if (player && player.id != null) targetUserId = player.id;
+        } catch (_) {}
+      }
       if (targetUserId == null) {
         try {
           const [rows] = await pool.execute(

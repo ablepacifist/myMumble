@@ -69,7 +69,16 @@ class NotificationsFeature {
       }
     } catch (_) {}
 
-    // 2. Bridge user_mapping table
+    // 2. Lexicon API (authoritative — user_mapping can go stale when Lexicon ids change)
+    try {
+      const player = await lexicon.getPlayerByUsername(username);
+      if (player && player.id != null) {
+        this.userIdCache.set(key, player.id);
+        return player.id;
+      }
+    } catch (_) {}
+
+    // 3. Bridge user_mapping table (fallback if Lexicon is unreachable)
     try {
       const [rows] = await this.deps.db.execute(
         'SELECT lexicon_user_id FROM user_mapping WHERE LOWER(lexicon_username) = LOWER(?)',
@@ -78,15 +87,6 @@ class NotificationsFeature {
       if (rows.length > 0 && rows[0].lexicon_user_id != null) {
         this.userIdCache.set(key, rows[0].lexicon_user_id);
         return rows[0].lexicon_user_id;
-      }
-    } catch (_) {}
-
-    // 3. Lexicon API
-    try {
-      const player = await lexicon.getPlayerByUsername(username);
-      if (player && player.id != null) {
-        this.userIdCache.set(key, player.id);
-        return player.id;
       }
     } catch (_) {}
 
