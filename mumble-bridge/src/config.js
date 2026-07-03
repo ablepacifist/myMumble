@@ -19,6 +19,12 @@ module.exports = {
   lexicon: {
     apiUrl: process.env.LEXICON_API_URL || 'http://localhost:36568',
   },
+  discord: {
+    botToken: process.env.DISCORD_BOT_TOKEN || '',
+    guildId: process.env.DISCORD_GUILD_ID || '',
+    channelId: process.env.DISCORD_CHANNEL_ID || '',
+    syncMumbleChannelId: parseInt(process.env.DISCORD_SYNC_MUMBLE_CHANNEL_ID) || 0,
+  },
   botPrefix: process.env.BOT_COMMAND_PREFIX || '!',
   logLevel: process.env.LOG_LEVEL || 'info',
   voiceDiagEnabled: (process.env.VOICE_DIAG_ENABLED || 'false').toLowerCase() === 'true',

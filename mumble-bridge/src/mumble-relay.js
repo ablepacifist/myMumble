@@ -4,6 +4,7 @@
 
 const lexicon = require('./lexicon-client');
 const featureRegistry = require('./feature-registry');
+const config = require('./config');
 
 /**
  * Set up listeners on the Mumble connection to relay events to web clients.
@@ -134,6 +135,16 @@ function setupMumbleListeners(mumble, state, broadcastAll, broadcastToChannel) {
           channelName,
           messageId: null,
         }).catch(() => {});
+      }
+
+      // Relay to Discord if this is the configured sync channel.
+      if (chId === config.discord.syncMumbleChannelId) {
+        const discordFeature = featureRegistry.features?.get('discord-sync');
+        if (discordFeature) {
+          discordFeature.getAvatarUrlFor(sender.name).then((avatarUrl) => {
+            discordFeature.relayToDiscord({ username: sender.name, avatarUrl, text: rawText });
+          }).catch(() => {});
+        }
       }
     }
   });

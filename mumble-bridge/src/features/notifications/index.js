@@ -110,13 +110,14 @@ class NotificationsFeature {
   }
 
   /** Broadcast "new message" notification. Fire-and-forget safe. */
-  async notifyMessage({ senderName, fromUserId = null, channelId, channelName, text }) {
+  async notifyMessage({ senderName, fromUserId = null, channelId, channelName, text, source = 'mumble' }) {
     if (!senderName || !text) return;
     const resolvedFrom = fromUserId != null ? fromUserId : await this.resolveUserId(senderName);
     await lexicon.postNotification({
       type: 'message',
       title: `#${channelName || 'chat'}`,
       body: `${senderName}: ${this._truncate(text)}`,
+      source,
       fromUsername: senderName,
       fromUserId: resolvedFrom,
       channelId,

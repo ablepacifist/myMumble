@@ -98,6 +98,7 @@ async function main() {
   await featureRegistry.init({
     db: getBridgePool(),
     lexicon,
+    mumble,
     broadcast: (msg) => wsServer._broadcastAll(msg),
     broadcastToChannel: (chId, msg, excludeWs) => wsServer._broadcastToChannel(chId, msg, excludeWs),
     getClients: () => wsServer.clients,

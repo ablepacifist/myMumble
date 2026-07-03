@@ -486,12 +486,12 @@ class LexiconClient {
    * Set deliverPush=false when another system already handles OS push for
    * this event (avoids double notifications).
    */
-  async postNotification({ targetUserId = null, type, title, body = null, fromUsername = null, fromUserId = null, channelId = null, link = null, deliverPush = true }) {
+  async postNotification({ targetUserId = null, type, title, body = null, source = 'mumble', fromUsername = null, fromUserId = null, channelId = null, link = null, deliverPush = true }) {
     try {
       const res = await fetch(`${this.baseUrl}/api/notifications`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ targetUserId, type, title, body, source: 'mumble', fromUsername, fromUserId, channelId, link, deliverPush }),
+        body: JSON.stringify({ targetUserId, type, title, body, source, fromUsername, fromUserId, channelId, link, deliverPush }),
       });
       if (!res.ok) {
         console.error(`[Lexicon] Failed to post notification: ${res.status}`);
