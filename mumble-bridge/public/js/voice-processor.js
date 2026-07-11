@@ -2,12 +2,15 @@
  * AudioWorklet processor for voice chat.
  * Runs on the audio thread — captures mic PCM and plays received PCM.
  *
- * Uses a ring buffer for playback to avoid GC pressure on the audio thread.
- * Includes an adaptive jitter buffer that won't reset on brief gaps.
+ * Uses per-sender ring buffers so multiple speakers are mixed at hardware
+ * clock precision. Each sender gets independent jitter buffering, and the
+ * process() callback additively mixes all active senders every 128 samples
+ * (~2.67ms at 48kHz). This eliminates the Node.js setInterval timing jitter
+ * that was causing 9-13% of frames to arrive at 40ms instead of 20ms.
  *
  * Messages from main thread:
- *   { type: 'playback', samples: Float32Array }  — audio to play out speakers
- *   { type: 'mute', muted: boolean }             — mute/unmute mic
+ *   { type: 'playback', senderId: number, samples: Float32Array }  — audio from a specific sender
+ *   { type: 'mute', muted: boolean }                                — mute/unmute mic
  *
  * Messages to main thread:
  *   { type: 'capture', samples: Int16Array }  — mic audio captured
@@ -17,33 +20,25 @@ class VoiceProcessor extends AudioWorkletProcessor {
     super();
     this.muted = false;
 
-    // ── Ring buffer for playback (avoids constant allocation) ──
-    // 1 second at 48kHz — plenty of room without being wasteful
-    this._ringSize = 48000;
-    this._ring = new Float32Array(this._ringSize);
-    this._writePos = 0;   // Next position to write incoming audio
-    this._readPos = 0;    // Next position to read for output
-    this._buffered = 0;   // Number of samples currently in the ring
+    // ── Per-sender ring buffers for playback ──
+    // Each Mumble user gets their own ring buffer with independent jitter
+    // buffering. This means each sender's audio stream absorbs its own
+    // network jitter without affecting other senders.
+    this._senders = new Map(); // senderId -> sender state object
+    this._ringSize = 48000;    // 1 second at 48kHz per sender
 
-    // ── Jitter buffer ──
+    // ── Jitter buffer settings ──
     // Initial buffering: wait until we have this many samples before starting.
-    // 960 samples = 20ms = 1 Opus frame. We buffer 3 frames (60ms) initially
-    // to absorb TCP batching — production logs show 12% of frames arrive in
-    // <2ms bursts due to Nagle's algorithm and TCP segment coalescing.
+    // 960 samples = 20ms = 1 Opus frame. Buffer 3 frames (60ms) initially.
     this._jitterThreshold = 960 * 3; // 60ms — 3 Opus frames
-    this._playing = false;
 
-    // Once playing, DON'T reset on brief gaps. Instead, output silence from
-    // the ring buffer and only stop after sustained silence (no new data for
-    // ~100ms = 4800 samples worth of output without any new writes).
-    // This prevents the aggressive re-buffer that was causing frame drops
-    // when network jitter caused momentary gaps between Opus frames.
-    this._drySamples = 0;               // samples of silence output since last write
-    this._dryThreshold = 960 * 5;       // 100ms — stop only after this much silence
+    // Once playing, DON'T reset on brief gaps. Only stop after sustained
+    // silence (~100ms) to prevent re-buffer penalty on momentary jitter.
+    this._dryThreshold = 960 * 5; // 100ms
 
     this.port.onmessage = (e) => {
       if (e.data.type === 'playback') {
-        this._writeToRing(e.data.samples);
+        this._writeToSenderRing(e.data.senderId, e.data.samples);
       } else if (e.data.type === 'mute') {
         this.muted = e.data.muted;
       }
@@ -51,36 +46,55 @@ class VoiceProcessor extends AudioWorkletProcessor {
   }
 
   /**
-   * Write incoming samples into the ring buffer.
+   * Get or create a ring buffer for a specific sender.
    */
-  _writeToRing(samples) {
+  _getOrCreateSender(senderId) {
+    let s = this._senders.get(senderId);
+    if (!s) {
+      s = {
+        ring: new Float32Array(this._ringSize),
+        writePos: 0,
+        readPos: 0,
+        buffered: 0,
+        playing: false,
+        drySamples: 0,
+      };
+      this._senders.set(senderId, s);
+    }
+    return s;
+  }
+
+  /**
+   * Write incoming samples into a specific sender's ring buffer.
+   */
+  _writeToSenderRing(senderId, samples) {
+    const s = this._getOrCreateSender(senderId);
     const len = samples.length;
 
     // If buffer would overflow, drop oldest audio to make room
-    if (this._buffered + len > this._ringSize) {
-      const overflow = (this._buffered + len) - this._ringSize;
-      this._readPos = (this._readPos + overflow) % this._ringSize;
-      this._buffered -= overflow;
+    if (s.buffered + len > this._ringSize) {
+      const overflow = (s.buffered + len) - this._ringSize;
+      s.readPos = (s.readPos + overflow) % this._ringSize;
+      s.buffered -= overflow;
     }
 
     // Write samples into ring, wrapping around if needed
-    const spaceToEnd = this._ringSize - this._writePos;
+    const spaceToEnd = this._ringSize - s.writePos;
     if (len <= spaceToEnd) {
-      this._ring.set(samples, this._writePos);
+      s.ring.set(samples, s.writePos);
     } else {
-      // Split write across the wrap boundary
-      this._ring.set(samples.subarray(0, spaceToEnd), this._writePos);
-      this._ring.set(samples.subarray(spaceToEnd), 0);
+      s.ring.set(samples.subarray(0, spaceToEnd), s.writePos);
+      s.ring.set(samples.subarray(spaceToEnd), 0);
     }
-    this._writePos = (this._writePos + len) % this._ringSize;
-    this._buffered += len;
+    s.writePos = (s.writePos + len) % this._ringSize;
+    s.buffered += len;
 
-    // Reset dry counter — we got new data
-    this._drySamples = 0;
+    // Reset dry counter — we got new data for this sender
+    s.drySamples = 0;
 
-    // Start playing once we've buffered enough (jitter buffer)
-    if (!this._playing && this._buffered >= this._jitterThreshold) {
-      this._playing = true;
+    // Start playing once we've buffered enough (jitter buffer filled)
+    if (!s.playing && s.buffered >= this._jitterThreshold) {
+      s.playing = true;
     }
   }
 
@@ -97,53 +111,51 @@ class VoiceProcessor extends AudioWorkletProcessor {
       this.port.postMessage({ type: 'capture', samples: int16 }, [int16.buffer]);
     }
 
-    // ── Playback: output received audio to speakers ──
+    // ── Playback: mix all sender buffers to output ──
     const output = outputs[0];
     if (output && output[0]) {
       const outChannel = output[0];
-      const needed = outChannel.length; // typically 128
+      const needed = outChannel.length; // typically 128 samples
 
-      if (!this._playing) {
-        // Haven't buffered enough yet — output silence
-        outChannel.fill(0);
-      } else if (this._buffered >= needed) {
-        // Normal path: read from ring buffer
-        const readEnd = this._readPos + needed;
-        if (readEnd <= this._ringSize) {
-          outChannel.set(this._ring.subarray(this._readPos, readEnd));
+      // Start with silence
+      outChannel.fill(0);
+
+      for (const [id, s] of this._senders) {
+        if (!s.playing) continue;
+
+        if (s.buffered >= needed) {
+          // Normal path: read from this sender's ring buffer and ADD to output
+          for (let i = 0; i < needed; i++) {
+            outChannel[i] += s.ring[(s.readPos + i) % this._ringSize];
+          }
+          s.readPos = (s.readPos + needed) % this._ringSize;
+          s.buffered -= needed;
+          s.drySamples = 0;
+        } else if (s.buffered > 0) {
+          // Partial data — read what we have, rest stays silence
+          const avail = s.buffered;
+          for (let i = 0; i < avail; i++) {
+            outChannel[i] += s.ring[(s.readPos + i) % this._ringSize];
+          }
+          s.readPos = (s.readPos + avail) % this._ringSize;
+          s.buffered = 0;
+          s.drySamples += (needed - avail);
         } else {
-          // Split read across wrap boundary
-          const first = this._ringSize - this._readPos;
-          outChannel.set(this._ring.subarray(this._readPos, this._ringSize), 0);
-          outChannel.set(this._ring.subarray(0, needed - first), first);
+          // No data from this sender — count dry samples
+          s.drySamples += needed;
+          if (s.drySamples >= this._dryThreshold) {
+            // Sender has been silent long enough — stop playing
+            // (will re-buffer on next audio arrival)
+            s.playing = false;
+            s.drySamples = 0;
+          }
         }
-        this._readPos = readEnd % this._ringSize;
-        this._buffered -= needed;
-        this._drySamples = 0;
-      } else if (this._buffered > 0) {
-        // Partial data — output what we have + silence for the rest
-        const avail = this._buffered;
-        if (this._readPos + avail <= this._ringSize) {
-          outChannel.set(this._ring.subarray(this._readPos, this._readPos + avail), 0);
-        } else {
-          const first = this._ringSize - this._readPos;
-          outChannel.set(this._ring.subarray(this._readPos, this._ringSize), 0);
-          outChannel.set(this._ring.subarray(0, avail - first), first);
-        }
-        for (let i = avail; i < needed; i++) outChannel[i] = 0;
-        this._readPos = (this._readPos + avail) % this._ringSize;
-        this._buffered = 0;
-        this._drySamples += (needed - avail);
-      } else {
-        // Buffer empty — output silence but DON'T immediately reset.
-        // Only reset after sustained silence so brief jitter gaps don't
-        // cause the 40ms re-buffer penalty.
-        outChannel.fill(0);
-        this._drySamples += needed;
-        if (this._drySamples >= this._dryThreshold) {
-          this._playing = false;
-          this._drySamples = 0;
-        }
+      }
+
+      // Clamp output to [-1, 1] to prevent distortion from mixing
+      for (let i = 0; i < needed; i++) {
+        if (outChannel[i] > 1) outChannel[i] = 1;
+        else if (outChannel[i] < -1) outChannel[i] = -1;
       }
     }
 

@@ -38,9 +38,11 @@ let decoderCleanupInterval = null;
 
 // ── Default Config ──
 const DEFAULT_CONFIG = {
-  mumbleHost: 'group-wildness.gl.at.ply.gg',
-  mumblePort: 58938,
-  lexiconUrl: 'http://147.185.221.24:15856',
+  mumbleHost: '127.0.0.1',
+  mumblePort: 64738,
+  lexiconUrl: 'https://api.alex-dyakin.com',
+  bridgeUrl: 'https://voice.alex-dyakin.com',
+  bridgeWsUrl: 'wss://voice.alex-dyakin.com',
   superUsers: ['alex'],
 };
 
@@ -178,6 +180,7 @@ ipcMain.handle('mumble:connect', async (_event, { host, port, username }) => {
   // we additively mix ALL incoming PCM into a single buffer that gets
   // flushed every 20ms.
   mumble.on('audio', ({ senderSession, pcm }) => {
+    voiceDiag.audioIn++;
     const len = Math.min(pcm.length, MIX_FRAME);
     for (let i = 0; i < len; i++) {
       const sum = mixBuf[i] + pcm[i];
@@ -189,9 +192,90 @@ ipcMain.handle('mumble:connect', async (_event, { host, port, username }) => {
   try {
     await mumble.connect();
     startMixer();
+    connectBridge(username);
     return { success: true, session: mumble.session };
   } catch (err) {
     return { success: false, error: err.message };
+  }
+});
+
+// ── Bridge WebSocket Connection ──
+// Connects to the bridge WS for features: DMs, reactions, typing, image messages
+const WebSocket = require('ws');
+let bridgeWs = null;
+let bridgeReconnectTimer = null;
+
+function connectBridge(username) {
+  if (bridgeWs) {
+    bridgeWs.close();
+    bridgeWs = null;
+  }
+
+  const wsUrl = store.get('bridgeWsUrl', DEFAULT_CONFIG.bridgeWsUrl);
+  try {
+    bridgeWs = new WebSocket(wsUrl);
+  } catch (err) {
+    console.error('[Bridge WS] Connection failed:', err.message);
+    return;
+  }
+
+  bridgeWs.on('open', () => {
+    console.log('[Bridge WS] Connected');
+    // Authenticate with the bridge
+    bridgeWs.send(JSON.stringify({ type: 'auth', username, password: username }));
+  });
+
+  bridgeWs.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      switch (msg.type) {
+        case 'auth_ok':
+          console.log('[Bridge WS] Authenticated');
+          // Request DM conversations
+          bridgeWs.send(JSON.stringify({ type: 'dm_conversations' }));
+          break;
+        case 'dm_message':
+        case 'dm_history':
+        case 'dm_conversations_list':
+        case 'dm_opened':
+        case 'reaction_update':
+        case 'notification':
+        case 'notifications':
+        case 'user_typing':
+          // Forward to renderer
+          send('bridge:message', msg);
+          break;
+        // Ignore text/image that come through bridge (we get those from Mumble directly)
+        default:
+          break;
+      }
+    } catch (_) {}
+  });
+
+  bridgeWs.on('close', () => {
+    console.log('[Bridge WS] Disconnected');
+    bridgeWs = null;
+    // Reconnect after 5 seconds
+    if (bridgeReconnectTimer) clearTimeout(bridgeReconnectTimer);
+    bridgeReconnectTimer = setTimeout(() => {
+      if (currentUser) connectBridge(currentUser.username || username);
+    }, 5000);
+  });
+
+  bridgeWs.on('error', (err) => {
+    console.error('[Bridge WS] Error:', err.message);
+  });
+}
+
+function disconnectBridge() {
+  if (bridgeReconnectTimer) { clearTimeout(bridgeReconnectTimer); bridgeReconnectTimer = null; }
+  if (bridgeWs) { bridgeWs.close(); bridgeWs = null; }
+}
+
+// IPC: Send message to bridge WS
+ipcMain.on('bridge:send', (_event, msg) => {
+  if (bridgeWs && bridgeWs.readyState === WebSocket.OPEN) {
+    bridgeWs.send(JSON.stringify(msg));
   }
 });
 
@@ -200,6 +284,7 @@ ipcMain.on('mumble:disconnect', () => {
     mumble.disconnect();
     mumble = null;
   }
+  disconnectBridge();
   stopMixer();
   currentUser = null;
 });
@@ -271,12 +356,58 @@ ipcMain.handle('mumble:get-history', async (_event, { channelId, limit }) => {
   }
 });
 
+// ── IPC: Avatar ──
+
+const avatarCache = new Map(); // username → { url, fetchedAt }
+const AVATAR_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+ipcMain.handle('mumble:get-avatar', async (_event, username) => {
+  // Check cache
+  const cached = avatarCache.get(username);
+  if (cached && Date.now() - cached.fetchedAt < AVATAR_CACHE_TTL) {
+    return cached.url;
+  }
+
+  if (!lexicon) return null;
+  try {
+    const bridgeUrl = store.get('bridgeUrl', DEFAULT_CONFIG.bridgeUrl);
+    const avatarPath = await lexicon.getAvatar(username, bridgeUrl);
+    if (avatarPath) {
+      const fullUrl = `${bridgeUrl}${avatarPath}`;
+      avatarCache.set(username, { url: fullUrl, fetchedAt: Date.now() });
+      return fullUrl;
+    }
+  } catch (_) {}
+  return null;
+});
+
+// ── IPC: Voice Diagnostics ──
+
+const voiceDiag = {
+  mixFlush: 0,
+  mixDrop: 0,
+  audioIn: 0,
+  audioOut: 0,
+  startTime: Date.now(),
+};
+
+ipcMain.handle('mumble:get-voice-diag', () => {
+  const uptime = Math.round((Date.now() - voiceDiag.startTime) / 1000);
+  return {
+    ...voiceDiag,
+    uptime,
+    activeDecoders: mumble?.voice?.decoderCount || 0,
+    connected: mumble?.ready || false,
+  };
+});
+
 // ── IPC: Settings ──
 
 ipcMain.handle('mumble:get-config', () => ({
   mumbleHost: store.get('mumbleHost', DEFAULT_CONFIG.mumbleHost),
   mumblePort: store.get('mumblePort', DEFAULT_CONFIG.mumblePort),
   lexiconUrl: store.get('lexiconUrl', DEFAULT_CONFIG.lexiconUrl),
+  bridgeUrl: store.get('bridgeUrl', DEFAULT_CONFIG.bridgeUrl),
 }));
 
 ipcMain.on('mumble:set-config', (_event, config) => {
@@ -299,6 +430,7 @@ function startMixer() {
     // Copy the buffer before sending (it gets cleared immediately)
     const out = Buffer.from(mixBuf.buffer, mixBuf.byteOffset, mixBuf.byteLength);
     send('mumble:audio-data', Buffer.from(out));
+    voiceDiag.mixFlush++;
 
     // Reset for next 20ms window
     mixBuf.fill(0);
@@ -322,6 +454,11 @@ function stopMixer() {
   }
   mixBuf.fill(0);
   mixDirty = false;
+  voiceDiag.startTime = Date.now();
+  voiceDiag.mixFlush = 0;
+  voiceDiag.mixDrop = 0;
+  voiceDiag.audioIn = 0;
+  voiceDiag.audioOut = 0;
 }
 
 // ── Helpers ──

@@ -31,6 +31,38 @@
 
   const DEFAULT_AVATAR = 'assets/default.jpg';
 
+  // Avatar cache — username → resolved URL
+  const avatarUrlCache = new Map();
+  const avatarPendingFetches = new Set();
+
+  /**
+   * Get avatar URL for a user. Returns cached URL immediately,
+   * or DEFAULT_AVATAR while fetching asynchronously.
+   * When the real URL arrives, updates all matching <img> elements.
+   */
+  function getAvatarUrl(username) {
+    if (!username) return DEFAULT_AVATAR;
+    if (avatarUrlCache.has(username)) return avatarUrlCache.get(username);
+    if (avatarPendingFetches.has(username)) return DEFAULT_AVATAR;
+
+    // Fetch async and update DOM when ready
+    avatarPendingFetches.add(username);
+    window.mumble.getAvatar(username).then((url) => {
+      avatarPendingFetches.delete(username);
+      if (url) {
+        avatarUrlCache.set(username, url);
+        // Update all avatar images for this user
+        document.querySelectorAll(`img[data-avatar-user="${CSS.escape(username)}"]`).forEach((img) => {
+          img.src = url;
+        });
+      }
+    }).catch(() => {
+      avatarPendingFetches.delete(username);
+    });
+
+    return DEFAULT_AVATAR;
+  }
+
   // Voice settings
   let voiceSettings = loadVoiceSettings();
 
@@ -276,11 +308,25 @@
     // Don't show our own messages (we already added them locally)
     if (msg.actor === mySession) return;
 
+    const cleanText = stripHtml(text);
     addChatMessage({
       username: senderName,
-      text: stripHtml(text),
+      text: cleanText,
       timestamp: new Date().toISOString(),
     });
+
+    // Desktop notification: always on @mention, otherwise only when the
+    // window is not focused (FEATURE_ROADMAP D1).
+    try {
+      const mentioned = username &&
+        new RegExp('@' + username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i').test(cleanText);
+      if (mentioned || !document.hasFocus()) {
+        const title = mentioned ? `${senderName} mentioned you` : `${senderName}`;
+        const body = cleanText.length > 140 ? cleanText.slice(0, 139) + '…' : cleanText;
+        const n = new Notification(title, { body, silent: !mentioned });
+        n.onclick = () => window.focus();
+      }
+    } catch (_) {}
   });
 
   window.mumble.on('mumble:audio-data', (data) => {
@@ -423,7 +469,8 @@
         voiceUsers.forEach((u) => {
           const vu = document.createElement('div');
           vu.className = 'voice-user';
-          vu.innerHTML = `<img class="avatar" src="${DEFAULT_AVATAR}" alt="" style="width:24px;height:24px;border-radius:50%"><span>${escapeHtml(u.name || 'Unknown')}</span>`;
+          const uName = u.name || 'Unknown';
+          vu.innerHTML = `<img class="avatar" data-avatar-user="${escapeHtml(uName)}" src="${getAvatarUrl(uName)}" alt="" style="width:24px;height:24px;border-radius:50%"><span>${escapeHtml(uName)}</span>`;
           userList.appendChild(vu);
         });
         container.appendChild(userList);
@@ -468,12 +515,16 @@
     const div = document.createElement('div');
     div.className = 'member-item' + (online ? ' online' : '');
     div.innerHTML = `
-      <img class="avatar avatar-sm" src="${DEFAULT_AVATAR}" alt="">
+      <img class="avatar avatar-sm" data-avatar-user="${escapeHtml(name)}" src="${getAvatarUrl(name)}" alt="">
       <div class="member-item-info">
         <div class="member-item-name">${escapeHtml(name)}</div>
         ${status ? `<div class="member-item-status">${escapeHtml(status)}</div>` : ''}
       </div>
     `;
+    // Click to open DM
+    div.addEventListener('click', () => openDMWith(name));
+    div.title = `Click to message ${name}`;
+    div.style.cursor = 'pointer';
     memberListContent.appendChild(div);
   }
 
@@ -481,6 +532,7 @@
   let currentVoiceChannelId = null;
 
   function joinChannel(chId) {
+    activeDMConversationId = null; // Exit DM mode
     currentChannelId = chId;
     lastMessageAuthor = null;
     lastMessageTime = 0;
@@ -489,8 +541,10 @@
 
     messageInput.disabled = false;
     sendBtn.disabled = false;
+    document.querySelector('.channel-hash').textContent = '#';
     updateChannelHeader();
     renderChannels();
+    renderDMList();
     loadHistory(chId);
   }
 
@@ -515,6 +569,7 @@
       const messages = await window.mumble.getHistory({ channelId, limit: 50 });
       if (messages && messages.length > 0) {
         addSystemMessage(`— Loaded ${messages.length} previous messages —`);
+        const historyIds = [];
         messages
           .sort((a, b) => {
             const tA = new Date(a.createdAt || a.sentAt || a.timestamp || 0).getTime();
@@ -522,15 +577,44 @@
             return tA - tB;
           })
           .forEach((m) => {
+            const msgId = m.id || null;
             addChatMessage({
+              id: msgId,
               username: m.senderName || m.username || 'Unknown',
               text: m.content || m.text || '',
               timestamp: m.createdAt || m.sentAt || m.timestamp || new Date().toISOString(),
+              type: m.messageType || 'TEXT',
+              messageType: m.messageType,
+              attachment: m.attachment || null,
             }, true);
+            if (msgId) historyIds.push(msgId);
           });
         scrollToBottom();
+        // Load reactions for all history messages
+        if (historyIds.length > 0) {
+          window.mumble.bridgeSend({ type: 'get_reactions_batch', messageIds: historyIds });
+        }
       }
     } catch (_) {}
+  }
+
+  // ── Rich Text Rendering ──
+  function renderRichText(text) {
+    let html = escapeHtml(text);
+    // Bold: **text**
+    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    // Italic: *text* or _text_
+    html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    html = html.replace(/(?<!\w)_(.+?)_(?!\w)/g, '<em>$1</em>');
+    // Strikethrough: ~~text~~
+    html = html.replace(/~~(.+?)~~/g, '<del>$1</del>');
+    // Inline code: `text`
+    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+    // Links
+    html = html.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+    // Newlines
+    html = html.replace(/\n/g, '<br>');
+    return html;
   }
 
   // ── Chat Messages ──
@@ -539,36 +623,76 @@
   }
 
   function addChatMessage(msg, isHistory) {
-    const key = msg.id ? String(msg.id) : dedupKey(msg.username, msg.text);
+    const dedupText = msg.text || msg.content || msg.caption || '';
+    const key = msg.id ? String(msg.id) : dedupKey(msg.username, dedupText);
     if (seenMessageIds.has(key)) return;
     seenMessageIds.add(key);
 
     const author = msg.username || 'Unknown';
     const time = msg.timestamp || new Date().toISOString();
     const timeMs = new Date(time).getTime();
-    const cleanText = stripHtml(msg.text || '');
+    const cleanText = stripHtml(msg.text || msg.content || msg.caption || '');
+    const isImageMsg = msg.type === 'image' || msg.messageType === 'IMAGE' || msg.messageType === 'GIF';
+
+    // Build content HTML
+    let contentHtml = '';
+
+    if (cleanText) {
+      contentHtml += `<div class="message-text">${renderRichText(cleanText)}</div>`;
+    }
+
+    // Image/GIF
+    if (isImageMsg) {
+      const att = msg.attachment || msg;
+      const imgUrl = att.thumbnailUrl || att.fileUrl || att.url;
+      const fullUrl = att.fileUrl || att.url || imgUrl;
+      if (imgUrl) {
+        const maxW = 400;
+        const w = att.width ? Math.min(att.width, maxW) : maxW;
+        contentHtml += `
+          <div class="message-attachment">
+            <img src="${imgUrl}" alt="image" class="chat-image"
+                 style="max-width:${w}px; border-radius: 8px; cursor: pointer;"
+                 loading="lazy"
+                 onclick="window.open('${fullUrl || imgUrl}','_blank')"
+                 onerror="this.style.display='none'">
+          </div>
+        `;
+      }
+    }
+
+    if (!contentHtml) {
+      contentHtml = '<div class="message-text"><em>(empty message)</em></div>';
+    }
 
     const showHeader = author !== lastMessageAuthor || (timeMs - lastMessageTime) > 7 * 60 * 1000;
+    const msgId = msg.id ? String(msg.id) : key;
+
+    // Reaction row
+    const reactionsHtml = `<div class="reactions-row" data-reactions-for="${escapeHtml(msgId)}"><button class="reaction-add-btn" title="Add reaction" data-msg-id="${escapeHtml(msgId)}">+</button></div>`;
 
     const div = document.createElement('div');
     div.className = 'message' + (showHeader ? ' has-header' : '');
+    div.dataset.messageId = msgId;
 
     if (showHeader) {
       div.innerHTML = `
-        <div class="message-avatar"><img class="avatar avatar-md" src="${DEFAULT_AVATAR}" alt=""></div>
+        <div class="message-avatar"><img class="avatar avatar-md" data-avatar-user="${escapeHtml(author)}" src="${getAvatarUrl(author)}" alt=""></div>
         <div class="message-body">
           <div class="message-header">
             <span class="message-author">${escapeHtml(author)}</span>
             <span class="message-timestamp">${formatTime(time)}</span>
           </div>
-          <div class="message-text">${escapeHtml(cleanText)}</div>
+          ${contentHtml}
+          ${reactionsHtml}
         </div>
       `;
     } else {
       div.innerHTML = `
         <div class="message-avatar"></div>
         <div class="message-body">
-          <div class="message-text">${escapeHtml(cleanText)}</div>
+          ${contentHtml}
+          ${reactionsHtml}
         </div>
       `;
     }
@@ -595,15 +719,24 @@
   }
 
   // ── Send Message ──
+  let activeDMConversationId = null;
+  let dmConversations = [];
+
   function sendMessage() {
     const text = messageInput.value.trim();
-    if (!text || currentChannelId === 0) return;
+    if (!text) return;
 
-    // Show locally immediately
-    addChatMessage({ username, text, timestamp: new Date().toISOString() });
-
-    // Send via IPC → main process → Mumble + Lexicon
-    window.mumble.sendText({ channelIds: [currentChannelId], message: text });
+    if (activeDMConversationId) {
+      // DM mode — send via bridge
+      window.mumble.bridgeSend({ type: 'dm_send', conversationId: activeDMConversationId, text });
+      addChatMessage({ username, text, timestamp: new Date().toISOString() });
+    } else {
+      if (currentChannelId === 0) return;
+      // Show locally immediately
+      addChatMessage({ username, text, timestamp: new Date().toISOString() });
+      // Send via IPC → main process → Mumble + Lexicon
+      window.mumble.sendText({ channelIds: [currentChannelId], message: text });
+    }
 
     messageInput.value = '';
     messageInput.focus();
@@ -960,6 +1093,205 @@
     if (meterFill) meterFill.style.width = '0%';
     voiceTestBtn.textContent = 'Test Microphone';
   }
+
+  // ── DMs ──
+  const dmSection = document.getElementById('dm-section');
+  const dmListEl = document.getElementById('dm-list');
+
+  function loadDMConversations() {
+    window.mumble.bridgeSend({ type: 'dm_conversations' });
+  }
+
+  function renderDMList() {
+    if (!dmListEl) return;
+    dmListEl.innerHTML = '';
+    dmConversations.forEach((conv) => {
+      const el = document.createElement('div');
+      el.className = 'dm-item' + (activeDMConversationId === conv.id ? ' active' : '');
+      el.innerHTML = `<span class="dm-username">${escapeHtml(conv.otherUser || conv.user1 || 'Unknown')}</span>`;
+      el.addEventListener('click', () => joinDMConversation(conv));
+      dmListEl.appendChild(el);
+    });
+  }
+
+  function joinDMConversation(conv) {
+    activeDMConversationId = conv.id;
+    // Clear messages
+    messagesEl.innerHTML = '';
+    lastMessageAuthor = null;
+    lastMessageTime = 0;
+    seenMessageIds.clear();
+    // Update header
+    document.getElementById('current-channel-name').textContent = `DM: ${conv.otherUser || 'Unknown'}`;
+    document.querySelector('.channel-hash').textContent = '@';
+    messageInput.placeholder = `Message @${conv.otherUser || 'Unknown'}`;
+    renderDMList();
+    // Request DM history
+    window.mumble.bridgeSend({ type: 'dm_history', conversationId: conv.id });
+  }
+
+  function openDMWith(targetUsername) {
+    if (targetUsername === username) return;
+    window.mumble.bridgeSend({ type: 'dm_open', targetUsername });
+  }
+
+  function handleBridgeMessage(msg) {
+    switch (msg.type) {
+      case 'dm_conversations_list':
+        dmConversations = (msg.conversations || []).map((c) => ({
+          ...c,
+          otherUser: (c.user1 === username) ? c.user2 : c.user1,
+        }));
+        renderDMList();
+        break;
+
+      case 'dm_opened': {
+        const conv = { id: msg.conversationId, otherUser: msg.otherUser || msg.targetUsername };
+        // Add to list if not there
+        if (!dmConversations.find((c) => c.id === conv.id)) {
+          dmConversations.unshift(conv);
+          renderDMList();
+        }
+        joinDMConversation(conv);
+        break;
+      }
+
+      case 'dm_history':
+        if (msg.messages) {
+          msg.messages
+            .sort((a, b) => new Date(a.timestamp || a.createdAt || 0) - new Date(b.timestamp || b.createdAt || 0))
+            .forEach((m) => {
+              addChatMessage({
+                id: m.id,
+                username: m.username || m.senderName || 'Unknown',
+                text: m.content || m.text || '',
+                timestamp: m.timestamp || m.createdAt || new Date().toISOString(),
+              }, true);
+            });
+          scrollToBottom();
+        }
+        break;
+
+      case 'dm_message':
+        if (msg.conversationId === activeDMConversationId) {
+          addChatMessage({
+            id: msg.id,
+            username: msg.username || msg.senderName || 'Unknown',
+            text: msg.content || msg.text || '',
+            timestamp: msg.timestamp || new Date().toISOString(),
+          });
+        }
+        // Update DM list preview
+        break;
+
+      case 'reaction_update':
+        updateReactionUI(msg);
+        break;
+
+      case 'reactions_batch':
+        if (msg.reactions) {
+          Object.entries(msg.reactions).forEach(([msgId, reactions]) => {
+            reactions.forEach((r) => updateReactionUI({ messageId: msgId, emoji: r.emoji, users: r.users, count: r.count }));
+          });
+        }
+        break;
+
+      default:
+        break;
+    }
+  }
+
+  // ── Reactions ──
+  function updateReactionUI(data) {
+    const row = document.querySelector(`[data-reactions-for="${data.messageId}"]`);
+    if (!row) return;
+
+    // Find or create badge for this emoji
+    let badge = row.querySelector(`[data-emoji="${data.emoji}"]`);
+    const count = data.count || (data.users ? data.users.length : 0);
+    if (count <= 0) {
+      if (badge) badge.remove();
+      return;
+    }
+
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'reaction-badge';
+      badge.dataset.emoji = data.emoji;
+      badge.addEventListener('click', () => {
+        toggleReaction(data.messageId, data.emoji);
+      });
+      // Insert before the + button
+      const addBtn = row.querySelector('.reaction-add-btn');
+      row.insertBefore(badge, addBtn);
+    }
+
+    const isMe = data.users && data.users.includes(username);
+    badge.className = 'reaction-badge' + (isMe ? ' mine' : '');
+    badge.textContent = `${data.emoji} ${count}`;
+  }
+
+  function toggleReaction(messageId, emoji) {
+    window.mumble.bridgeSend({ type: 'toggle_reaction', messageId, emoji });
+  }
+
+  // ── Emoji Picker ──
+  const EMOJI_LIST = ['😀','😂','😍','🥰','😎','🤔','👍','👎','❤️','🔥','🎉','💯','😢','😡','🤣','👀','✅','❌','🙏','💪','🚀','⭐','🎮','💀','😭','🤡','💩','👋','🤝','💕'];
+  const emojiBtn = document.getElementById('emoji-btn');
+  const emojiPicker = document.getElementById('emoji-picker');
+  let emojiPickerTarget = null; // null = insert into input, or { messageId } for reactions
+
+  function buildEmojiPicker() {
+    emojiPicker.innerHTML = EMOJI_LIST.map((e) =>
+      `<span class="emoji-item">${e}</span>`
+    ).join('');
+    emojiPicker.addEventListener('click', (ev) => {
+      const item = ev.target.closest('.emoji-item');
+      if (!item) return;
+      const emoji = item.textContent;
+      if (emojiPickerTarget && emojiPickerTarget.messageId) {
+        // Reaction mode
+        toggleReaction(emojiPickerTarget.messageId, emoji);
+      } else {
+        // Insert into message input
+        messageInput.value += emoji;
+        messageInput.focus();
+      }
+      emojiPicker.classList.add('hidden');
+      emojiPickerTarget = null;
+    });
+  }
+  buildEmojiPicker();
+
+  emojiBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    emojiPickerTarget = null;
+    emojiPicker.classList.toggle('hidden');
+  });
+
+  // Reaction add button click handler (delegated)
+  document.addEventListener('click', (e) => {
+    const addBtn = e.target.closest('.reaction-add-btn');
+    if (addBtn) {
+      e.stopPropagation();
+      const msgId = addBtn.dataset.msgId;
+      emojiPickerTarget = { messageId: msgId };
+      // Position near the button
+      const rect = addBtn.getBoundingClientRect();
+      emojiPicker.style.position = 'fixed';
+      emojiPicker.style.bottom = (window.innerHeight - rect.top + 4) + 'px';
+      emojiPicker.style.left = rect.left + 'px';
+      emojiPicker.classList.remove('hidden');
+      return;
+    }
+    // Close emoji picker if clicking elsewhere
+    if (!e.target.closest('.emoji-picker') && !e.target.closest('#emoji-btn')) {
+      emojiPicker.classList.add('hidden');
+    }
+  });
+
+  // ── Bridge message listener ──
+  window.mumble.on('bridge:message', handleBridgeMessage);
 
   // ── Event Listeners ──
   loginBtn.addEventListener('click', connect);

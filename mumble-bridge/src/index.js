@@ -1,8 +1,9 @@
 const MumbleConnection = require('./mumble-connection');
 const BridgeWebSocketServer = require('./ws-server');
 const BotEngine = require('./bot-engine');
-const { initBridgeDatabase } = require('./database');
+const { initBridgeDatabase, getBridgePool } = require('./database');
 const lexicon = require('./lexicon-client');
+const featureRegistry = require('./feature-registry');
 const config = require('./config');
 
 // Prevent crashes from killing the server — log and keep running
@@ -30,7 +31,15 @@ async function main() {
 
   // 2. Login to Lexicon as bridge service user
   console.log('[Boot] Logging into Lexicon API as bridge service...');
-  await lexicon.loginAsService();
+  try {
+    await Promise.race([
+      lexicon.loginAsService(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Lexicon login timeout after 5s')), 5000)),
+    ]);
+  } catch (err) {
+    console.warn(`[Boot] Lexicon login unavailable at startup: ${err.message}`);
+    console.warn('[Boot] Continuing startup without Lexicon pre-login. Service will retry on demand.');
+  }
 
   // 3. Load Mumble protocol definitions and connect
   // 3. Load Mumble protocol definitions and connect
@@ -53,9 +62,12 @@ async function main() {
     }
   }, 15000);
 
-  // Reconnect on disconnect
+  // Reconnect on disconnect (with guard to prevent reconnect loop)
+  let reconnecting = false;
   mumble.on('disconnected', () => {
-    console.log('[Mumble] Disconnected. Reconnecting in 5 seconds...');
+    if (reconnecting || mumble.connected) return;
+    reconnecting = true;
+    console.log('[Mumble] Disconnected. Reconnecting in 15 seconds...');
     setTimeout(async () => {
       try {
         await mumble.connect('MumbleBridge', '');
@@ -63,7 +75,8 @@ async function main() {
       } catch (err) {
         console.error('[Mumble] Reconnect failed:', err.message);
       }
-    }, 5000);
+      reconnecting = false;
+    }, 15000);
   });
 
   // 3. Start WebSocket server
@@ -80,7 +93,23 @@ async function main() {
   const bot = new BotEngine(mumble, wsServer);
   bot.init();
 
-  // 5. Log when Mumble syncs (fully connected)
+  // 5. Load feature modules (rich-text, typing, etc.)
+  console.log('[Boot] Loading feature modules...');
+  await featureRegistry.init({
+    db: getBridgePool(),
+    lexicon,
+    mumble,
+    broadcast: (msg) => wsServer._broadcastAll(msg),
+    broadcastToChannel: (chId, msg, excludeWs) => wsServer._broadcastToChannel(chId, msg, excludeWs),
+    getClients: () => wsServer.clients,
+    getWebClients: () => wsServer.webClients,
+    channels: wsServer.channels,
+  });
+
+  // Store registry on wsServer so client-handler can access it
+  wsServer.featureRegistry = featureRegistry;
+
+  // 6. Log when Mumble syncs (fully connected)
   mumble.on('ServerSync', (msg) => {
     console.log(`[Boot] ✅ Mumble sync complete. Welcome message: ${msg.welcomeText || '(none)'}`);
     console.log('[Boot] ✅ Bridge is fully operational!');
@@ -90,6 +119,7 @@ async function main() {
   // Graceful shutdown
   const shutdown = () => {
     console.log('\n[Shutdown] Shutting down...');
+    featureRegistry.cleanup();
     clearInterval(pingInterval);
     mumble.disconnect();
     if (wsServer.wss) wsServer.wss.close();

@@ -4,6 +4,8 @@
 const { getBridgePool, getMumblePool, getAvatarPath } = require('./database');
 const lexicon = require('./lexicon-client');
 const config = require('./config');
+const featureRegistry = require('./feature-registry');
+const richText = require('./features/rich-text');
 
 function isSuperUser(username) {
   return config.superUsers.includes((username || '').toLowerCase());
@@ -38,7 +40,7 @@ async function handleClientMessage(ws, msg, client, ctx) {
           await pool.execute(
             `INSERT INTO user_mapping (lexicon_user_id, lexicon_username, display_name)
              VALUES (?, ?, ?)
-             ON DUPLICATE KEY UPDATE display_name = VALUES(display_name), last_seen = NOW()`,
+             ON DUPLICATE KEY UPDATE lexicon_user_id = VALUES(lexicon_user_id), display_name = VALUES(display_name), last_seen = NOW()`,
             [player.id, username, client.username]
           );
         } catch (err) {
@@ -82,6 +84,124 @@ async function handleClientMessage(ws, msg, client, ctx) {
         webClientList.push({ id, username: wc.username, channelId: wc.channelId, inVoice: wc.inVoice, voiceChannelId: wc.voiceChannelId, avatarUrl: wc.avatarUrl });
       }
       ws.send(JSON.stringify({ type: 'web_users', webClients: webClientList }));
+
+      // Send unread DM counts on connect
+      try {
+        const dmsFeature = featureRegistry.features?.get('dms');
+        if (dmsFeature && client.userId) {
+          const unreads = await dmsFeature.getUnreadCounts(client.userId);
+          if (unreads.length > 0) {
+            ws.send(JSON.stringify({ type: 'dm_unread_counts', unreads }));
+          }
+        }
+      } catch (_) {}
+      break;
+    }
+
+    case 'push_subscribe': {
+      if (!client.authenticated) return;
+      const ok = await lexicon.pushSubscribe({
+        userId: client.userId,
+        endpoint: msg.subscription?.endpoint,
+        keys: msg.subscription?.keys,
+        userAgent: msg.userAgent || 'MumbleChat Web',
+      });
+      ws.send(JSON.stringify({ type: 'push_subscribe_ok', success: ok }));
+      break;
+    }
+
+    case 'push_unsubscribe': {
+      if (!client.authenticated) return;
+      await lexicon.pushUnsubscribe(msg.endpoint);
+      ws.send(JSON.stringify({ type: 'push_unsubscribe_ok', success: true }));
+      break;
+    }
+
+    case 'sso_auth': {
+      if (!msg.token) {
+        ws.send(JSON.stringify({ type: 'error', message: 'SSO token is required' }));
+        break;
+      }
+
+      console.log(`[WS] SSO auth request`);
+      const ssoResult = await lexicon.validateSsoToken(msg.token);
+
+      if (!ssoResult || !ssoResult.valid) {
+        ws.send(JSON.stringify({ type: 'auth_error', message: 'Invalid or expired SSO token' }));
+        break;
+      }
+
+      // SSO validated — log user in
+      const ssoUsername = ssoResult.username;
+      const ssoPlayer = await lexicon.getOrCreateUser(ssoUsername);
+      client.username = ssoPlayer.displayName || ssoPlayer.username || ssoUsername;
+      client.userId = ssoResult.userId || ssoPlayer.id;
+      client.authenticated = true;
+
+      if (client.userId) {
+        try {
+          const pool = getBridgePool();
+          await pool.execute(
+            `INSERT INTO user_mapping (lexicon_user_id, lexicon_username, display_name)
+             VALUES (?, ?, ?)
+             ON DUPLICATE KEY UPDATE lexicon_user_id = VALUES(lexicon_user_id), display_name = VALUES(display_name), last_seen = NOW()`,
+            [client.userId, ssoUsername, client.username]
+          );
+        } catch (err) {
+          console.log(`[WS] User mapping update failed: ${err.message}`);
+        }
+      }
+
+      client.isAdmin = isSuperUser(client.username);
+
+      ws.send(JSON.stringify({
+        type: 'auth_ok',
+        username: client.username,
+        userId: client.userId,
+        isAdmin: client.isAdmin,
+        sso: true,
+      }));
+
+      // Avatar
+      let ssoAvatarUrl = '/uploads/avatars/default.jpg';
+      try {
+        const ap = await getAvatarPath(client.username);
+        if (ap) ssoAvatarUrl = ap;
+      } catch (_) {}
+
+      const ssoWebClientId = `web_${client.userId}`;
+      client.webClientId = ssoWebClientId;
+      ctx.webClients.set(ssoWebClientId, {
+        username: client.username,
+        userId: client.userId,
+        channelId: client.channelId || 0,
+        inVoice: false,
+        voiceChannelId: null,
+        avatarUrl: ssoAvatarUrl,
+        ws,
+      });
+      ctx.broadcastAll({
+        type: 'web_user_join',
+        webClient: { id: ssoWebClientId, username: client.username, channelId: client.channelId || 0, inVoice: false, avatarUrl: ssoAvatarUrl },
+      });
+      const ssoWebClientList = [];
+      for (const [id, wc] of ctx.webClients) {
+        ssoWebClientList.push({ id, username: wc.username, channelId: wc.channelId, inVoice: wc.inVoice, voiceChannelId: wc.voiceChannelId, avatarUrl: wc.avatarUrl });
+      }
+      ws.send(JSON.stringify({ type: 'web_users', webClients: ssoWebClientList }));
+
+      // Send unread DM counts
+      try {
+        const dmsFeature = featureRegistry.features?.get('dms');
+        if (dmsFeature && client.userId) {
+          const unreads = await dmsFeature.getUnreadCounts(client.userId);
+          if (unreads.length > 0) {
+            ws.send(JSON.stringify({ type: 'dm_unread_counts', unreads }));
+          }
+        }
+      } catch (_) {}
+
+      console.log(`[WS] SSO login successful: ${client.username} (ID: ${client.userId})`);
       break;
     }
 
@@ -97,13 +217,20 @@ async function handleClientMessage(ws, msg, client, ctx) {
 
       ctx.mumble.sendTextMessage([channelId], `<b>${client.username}:</b> ${text}`);
 
-      lexicon.storeMessage({
-        channelId,
-        channelName,
-        userId: client.userId || 0,
-        username: client.username,
-        content: text,
-      }).catch(err => console.error(`[WS] Lexicon message store failed: ${err.message}`));
+      // Store in Lexicon
+      let lexiconResult = null;
+      try {
+        lexiconResult = await lexicon.storeMessage({
+          channelId,
+          channelName,
+          userId: client.userId || 0,
+          username: client.username,
+          content: text,
+        });
+      } catch (err) {
+        console.error(`[Lexicon] Message store failed: ${err.message}`);
+      }
+      const msgId = lexiconResult?.messageId || null;
 
       ctx.broadcastToChannel(channelId, {
         type: 'text',
@@ -111,8 +238,98 @@ async function handleClientMessage(ws, msg, client, ctx) {
         userId: client.userId,
         username: client.username,
         text,
+        html: richText.formatRichText(text),
         timestamp: new Date().toISOString(),
-      }, ws);
+        id: msgId,
+      });
+
+      // Process @mentions (async, non-blocking)
+      const mentionsFeature = featureRegistry.features?.get('mentions');
+      if (mentionsFeature && mentionsFeature.processMentions) {
+        mentionsFeature.processMentions({
+          text,
+          fromUsername: client.username,
+          fromUserId: client.userId,
+          channelId,
+          channelName,
+          messageId: msgId,
+        }).catch(err => console.error(`[Mentions] Process failed: ${err.message}`));
+      }
+
+      // Forward to Lexicon app notifications (async, non-blocking).
+      // userId 0 is valid — use ?? so it isn't coerced to null.
+      const notificationsFeature = featureRegistry.features?.get('notifications');
+      if (notificationsFeature) {
+        notificationsFeature.notifyMessage({
+          senderName: client.username,
+          fromUserId: client.userId ?? null,
+          channelId,
+          channelName,
+          text,
+        }).catch(() => {});
+      }
+
+      // Relay to Discord if this is the configured sync channel.
+      if (channelId === config.discord.syncMumbleChannelId) {
+        const discordFeature = featureRegistry.features?.get('discord-sync');
+        if (discordFeature) {
+          discordFeature.getAvatarUrlFor(client.username).then((avatarUrl) => {
+            discordFeature.relayToDiscord({ username: client.username, avatarUrl, text });
+          }).catch(() => {});
+        }
+      }
+      break;
+    }
+
+    case 'image': {
+      if (!client.authenticated) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Not authenticated' }));
+        return;
+      }
+
+      const imgChannelId = msg.channelId || 0;
+      const imgChannelName = ctx.channels.get(imgChannelId)?.name || '';
+
+      // Store in Lexicon
+      let imgResult = null;
+      try {
+        imgResult = await lexicon.storeMessage({
+          channelId: imgChannelId,
+          channelName: imgChannelName,
+          userId: client.userId || 0,
+          username: client.username,
+          content: msg.caption || '',
+          messageType: msg.isGif ? 'GIF' : 'IMAGE',
+          mediaFileId: msg.fileId,
+        });
+      } catch (err) {
+        console.error(`[Lexicon] Image store failed: ${err.message}`);
+      }
+      const imgMsgId = imgResult?.messageId || null;
+
+      // Broadcast to channel (including sender — ensures everyone has the real Lexicon ID)
+      ctx.broadcastToChannel(imgChannelId, {
+        type: 'image',
+        channelId: imgChannelId,
+        userId: client.userId,
+        username: client.username,
+        fileId: msg.fileId,
+        fileUrl: msg.fileUrl,
+        thumbnailUrl: msg.thumbnailUrl,
+        originalFilename: msg.originalFilename,
+        mimeType: msg.mimeType,
+        width: msg.width,
+        height: msg.height,
+        caption: msg.caption || '',
+        timestamp: new Date().toISOString(),
+        id: imgMsgId,
+      });
+
+      // Send text fallback to Mumble (Mumble can't render images)
+      const linkText = msg.caption
+        ? `<b>${client.username}:</b> ${msg.caption} [image: ${msg.originalFilename}]`
+        : `<b>${client.username}</b> shared an image: ${msg.originalFilename}`;
+      ctx.mumble.sendTextMessage([imgChannelId], linkText);
       break;
     }
 
@@ -269,6 +486,18 @@ async function handleClientMessage(ws, msg, client, ctx) {
           wc.voiceChannelId = voiceChId;
           ctx.broadcastAll({ type: 'voice_state', id: client.webClientId, username: client.username, inVoice: true, voiceChannelId: voiceChId });
         }
+
+        // Forward to Lexicon app notifications (async, non-blocking).
+        // userId 0 is valid — use ?? so it isn't coerced to null.
+        const notifFeature = featureRegistry.features?.get('notifications');
+        if (notifFeature) {
+          notifFeature.notifyVoiceJoin({
+            name: client.username,
+            fromUserId: client.userId ?? null,
+            channelId: voiceChId || 0,
+            channelName: ctx.channels.get(voiceChId)?.name,
+          }).catch(() => {});
+        }
       } catch (err) {
         console.error(`[Voice] Start error for ${client.username}:`, err.message);
         client.voicePeerId = null;
@@ -323,7 +552,10 @@ async function handleClientMessage(ws, msg, client, ctx) {
     }
 
     default:
-      ws.send(JSON.stringify({ type: 'error', message: `Unknown message type: ${msg.type}` }));
+      // Try feature registry before returning error
+      if (!featureRegistry.route(ws, client, msg)) {
+        ws.send(JSON.stringify({ type: 'error', message: `Unknown message type: ${msg.type}` }));
+      }
   }
 }
 

@@ -9,11 +9,14 @@
     "test": "node tests/run-all.js",
     "test:http": "node tests/test-http-server.js",
     "test:ws": "node tests/test-ws-connect.js",
+    "test:ws:quality": "node tests/test-ws-quality.js",
     "test:voice": "node tests/test-voice-bridge.js",
     "test:e2e": "node tests/test-two-clients.js",
     "test:3way": "node tests/test-three-clients.js",
     "test:stability": "node tests/test-stability.js",
-    "test:live": "node tests/test-live.js"
+    "test:live": "node tests/test-live.js",
+    "test:features": "node tests/test-features-phase1.js",
+    "build:react": "cd public/react-src && npm run build"
   },
   "keywords": [
     "mumble",
@@ -24,7 +27,9 @@
   "author": "alex",
   "license": "ISC",
   "dependencies": {
+    "discord.js": "^14.26.4",
     "dotenv": "^17.3.1",
+    "form-data": "^4.0.5",
     "mysql2": "^3.17.1",
     "node-fetch": "^2.7.0",
     "opusscript": "^0.1.1",

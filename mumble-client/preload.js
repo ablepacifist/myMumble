@@ -17,6 +17,11 @@ contextBridge.exposeInMainWorld('mumble', {
   getHistory: (data) => ipcRenderer.invoke('mumble:get-history', data),
   getConfig: () => ipcRenderer.invoke('mumble:get-config'),
   setConfig: (config) => ipcRenderer.send('mumble:set-config', config),
+  getAvatar: (username) => ipcRenderer.invoke('mumble:get-avatar', username),
+  getVoiceDiag: () => ipcRenderer.invoke('mumble:get-voice-diag'),
+
+  // ── Bridge WS Actions ──
+  bridgeSend: (msg) => ipcRenderer.send('bridge:send', msg),
 
   // ── Events (main → renderer) ──
   on: (channel, callback) => {
@@ -30,6 +35,7 @@ contextBridge.exposeInMainWorld('mumble', {
       'mumble:audio-data',
       'mumble:error',
       'mumble:disconnected',
+      'bridge:message',
     ];
     if (!validChannels.includes(channel)) return () => {};
 

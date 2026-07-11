@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src *; media-src *;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src *; media-src *; img-src * data:;">
   <title>MumbleChat</title>
   <link rel="stylesheet" href="style.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -41,6 +41,14 @@
 
       <!-- Channel Tree -->
       <div class="channel-tree" id="channel-tree"></div>
+
+      <!-- DM Section -->
+      <div class="dm-section" id="dm-section">
+        <div class="dm-header">
+          <span class="dm-header-label">Direct Messages</span>
+        </div>
+        <div class="dm-list" id="dm-list"></div>
+      </div>
 
       <!-- Channel Create Dialog -->
       <div id="channel-dialog" class="sidebar-dialog hidden">
@@ -107,10 +115,12 @@
           <div id="input-bar">
             <div class="input-wrapper">
               <input type="text" id="message-input" placeholder="Message #general" autocomplete="off" maxlength="2000" disabled>
+              <button id="emoji-btn" class="input-icon-btn" title="Emoji picker">😀</button>
               <button id="send-btn" class="btn btn-primary" disabled>
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
               </button>
             </div>
+            <div id="emoji-picker" class="emoji-picker hidden"></div>
           </div>
         </div>
 
