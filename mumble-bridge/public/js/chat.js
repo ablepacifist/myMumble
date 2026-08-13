@@ -10,6 +10,9 @@
   let username = '';
   let userId = null;
   let isAdmin = false;
+  let dialogMode = 'create';           // 'create' | 'edit' — channel dialog mode
+  let editingChannelId = null;         // channel id being edited, when dialogMode === 'edit'
+  let pendingDiscordLinkForNewChannel = null; // discord channel id to link once create_channel is acked
   let currentChannelId = 1;  // default to 'general' channel
   let activeDMConversationId = null; // currently open DM conversation
   let dmConversations = [];          // list of DM conversations
@@ -59,9 +62,12 @@
   const sendBtn         = $('#send-btn');
   const statusDot       = $('#connection-status');
   const channelDialog   = $('#channel-dialog');
+  const channelDialogTitle = $('#channel-dialog-title');
   const channelNameInput = $('#channel-name-input');
   const channelCategorySelect = $('#channel-category-select');
   const channelVoiceCheck = $('#channel-voice-check');
+  const channelDiscordIdInput = $('#channel-discord-id-input');
+  const channelDialogStatus = $('#channel-dialog-status');
   const channelSaveBtn  = $('#channel-save-btn');
   const channelCancelBtn = $('#channel-cancel-btn');
   const membersToggle   = $('#members-toggle');
@@ -373,6 +379,17 @@
         renderChannels();
         break;
 
+      case 'channel_created':
+        if (msg.channel && pendingDiscordLinkForNewChannel) {
+          send({ type: 'set_channel_discord_link', channelId: msg.channel.id, discordChannelId: pendingDiscordLinkForNewChannel });
+          pendingDiscordLinkForNewChannel = null;
+        }
+        break;
+
+      case 'channel_discord_link_result':
+        if (!msg.success) alert(`Failed to update Discord link: ${msg.error || 'unknown error'}`);
+        break;
+
       case 'user_update':
         if (msg.user) {
           users.set(msg.user.session, msg.user);
@@ -651,7 +668,7 @@
       header.addEventListener('click', (e) => {
         if (e.target.closest('.category-action-btn')) {
           e.stopPropagation();
-          openChannelDialog(cat.id);
+          openCreateChannelDialog(cat.id);
           return;
         }
         if (isCollapsed) collapsedCategories.delete(cat.id);
@@ -707,10 +724,16 @@
       <span class="channel-icon">${icon}</span>
       <span class="channel-name">${escapeHtml(ch.name || 'Unnamed')}</span>
       ${isAdmin ? `<div class="channel-actions">
+        <button class="channel-action-btn channel-edit-btn" title="Edit Discord link">&#9998;</button>
         <button class="channel-action-btn" title="Delete channel">&times;</button>
       </div>` : ''}
     `;
     item.addEventListener('click', (e) => {
+      if (e.target.closest('.channel-edit-btn')) {
+        e.stopPropagation();
+        openEditChannelDialog(ch);
+        return;
+      }
       if (e.target.closest('.channel-action-btn')) {
         e.stopPropagation();
         if (confirm(`Delete #${ch.name}?`)) {
@@ -746,11 +769,34 @@
     return item;
   }
 
-  function openChannelDialog(parentId) {
-    channelDialog.classList.remove('hidden');
+  function openCreateChannelDialog(parentId) {
+    dialogMode = 'create';
+    editingChannelId = null;
+    channelDialogTitle.textContent = 'New Channel';
+    channelNameInput.disabled = false;
+    channelCategorySelect.disabled = false;
     channelNameInput.value = '';
+    channelDiscordIdInput.value = '';
+    channelDialogStatus.textContent = '';
+    channelSaveBtn.textContent = 'Create';
+    channelDialog.classList.remove('hidden');
     channelNameInput.focus();
     if (parentId !== undefined) channelCategorySelect.value = String(parentId);
+  }
+
+  function openEditChannelDialog(ch) {
+    dialogMode = 'edit';
+    editingChannelId = ch.id;
+    channelDialogTitle.textContent = `Edit #${ch.name}`;
+    channelNameInput.value = ch.name || '';
+    channelNameInput.disabled = true;
+    channelCategorySelect.value = String(ch.parentId || 0);
+    channelCategorySelect.disabled = true;
+    channelDiscordIdInput.value = ch.discordChannelId || '';
+    channelDialogStatus.textContent = '';
+    channelSaveBtn.textContent = 'Save';
+    channelDialog.classList.remove('hidden');
+    channelDiscordIdInput.focus();
   }
 
   // ── Rendering: Member List (right panel) ─────────────────
@@ -1813,12 +1859,22 @@
   // Channel dialog
   channelCancelBtn.addEventListener('click', () => channelDialog.classList.add('hidden'));
   channelSaveBtn.addEventListener('click', () => {
-    const name = channelNameInput.value.trim();
-    if (name) {
-      const parentId = parseInt(channelCategorySelect.value) || 0;
-      send({ type: 'create_channel', name, parentId });
-      channelDialog.classList.add('hidden');
+    const discordChannelId = channelDiscordIdInput.value.trim();
+    if (discordChannelId && !/^\d{5,25}$/.test(discordChannelId)) {
+      channelDialogStatus.textContent = 'Discord channel ID must be numeric (Discord → right-click channel → Copy Channel ID).';
+      return;
     }
+
+    if (dialogMode === 'create') {
+      const name = channelNameInput.value.trim();
+      if (!name) return;
+      const parentId = parseInt(channelCategorySelect.value) || 0;
+      pendingDiscordLinkForNewChannel = discordChannelId || null;
+      send({ type: 'create_channel', name, parentId });
+    } else {
+      send({ type: 'set_channel_discord_link', channelId: editingChannelId, discordChannelId: discordChannelId || null });
+    }
+    channelDialog.classList.add('hidden');
   });
   channelNameInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') channelSaveBtn.click();
