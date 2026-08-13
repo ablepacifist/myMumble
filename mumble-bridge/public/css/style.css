@@ -335,6 +335,8 @@ a:hover { text-decoration: underline; }
 .sidebar-dialog select:focus,
 .sidebar-dialog input:focus { box-shadow: 0 0 0 2px var(--brand-primary); }
 .dialog-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.dialog-title { font-size: 12px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); }
+.dialog-status { font-size: 12px; color: var(--text-danger); min-height: 14px; }
 
 .checkbox-label {
   display: flex;

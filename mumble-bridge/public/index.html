@@ -46,13 +46,16 @@
         <div class="dm-list" id="dm-list"></div>
       </div>
 
-      <!-- Channel Create Dialog -->
+      <!-- Channel Create / Edit Dialog -->
       <div id="channel-dialog" class="sidebar-dialog hidden">
+        <div id="channel-dialog-title" class="dialog-title">New Channel</div>
         <select id="channel-category-select">
           <option value="0">No Category (Root)</option>
         </select>
         <input type="text" id="channel-name-input" placeholder="channel-name" maxlength="50">
         <label class="checkbox-label"><input type="checkbox" id="channel-voice-check"> Voice Channel</label>
+        <input type="text" id="channel-discord-id-input" placeholder="Discord channel ID (optional)" maxlength="32">
+        <div id="channel-dialog-status" class="dialog-status"></div>
         <div class="dialog-actions">
           <button id="channel-save-btn" class="btn btn-small btn-primary">Create</button>
           <button id="channel-cancel-btn" class="btn btn-small">Cancel</button>

@@ -269,14 +269,12 @@ async function handleClientMessage(ws, msg, client, ctx) {
         }).catch(() => {});
       }
 
-      // Relay to Discord if this is the configured sync channel.
-      if (channelId === config.discord.syncMumbleChannelId) {
-        const discordFeature = featureRegistry.features?.get('discord-sync');
-        if (discordFeature) {
-          discordFeature.getAvatarUrlFor(client.username).then((avatarUrl) => {
-            discordFeature.relayToDiscord({ username: client.username, avatarUrl, text });
-          }).catch(() => {});
-        }
+      // Relay to Discord if this Mumble channel has a Discord link.
+      const discordFeature = featureRegistry.features?.get('discord-sync');
+      if (discordFeature && discordFeature.isLinked(channelId)) {
+        discordFeature.getAvatarUrlFor(client.username).then((avatarUrl) => {
+          discordFeature.relayToDiscord({ mumbleChannelId: channelId, username: client.username, avatarUrl, text });
+        }).catch(() => {});
       }
       break;
     }
