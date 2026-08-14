@@ -9,6 +9,7 @@ const VoiceBridge = require('./voice-bridge');
 const { createHttpServer } = require('./http-server');
 const { setupMumbleListeners } = require('./mumble-relay');
 const { handleClientMessage } = require('./client-handler');
+const featureRegistry = require('./feature-registry');
 
 class BridgeWebSocketServer {
   /**
@@ -57,6 +58,8 @@ class BridgeWebSocketServer {
       state,
       (msg) => this._broadcastAll(msg),
       (chId, msg, excludeWs) => this._broadcastToChannel(chId, msg, excludeWs),
+      (channel) => this.broadcastChannelUpdate(channel),
+      (channelId) => this.broadcastChannelRemove(channelId),
     );
 
     return new Promise((resolve) => {
@@ -81,6 +84,9 @@ class BridgeWebSocketServer {
       webClients: this.webClients,
       broadcastAll: (msg) => this._broadcastAll(msg),
       broadcastToChannel: (chId, msg, excludeWs) => this._broadcastToChannel(chId, msg, excludeWs),
+      broadcastChannelUpdate: (channel) => this.broadcastChannelUpdate(channel),
+      broadcastChannelRemove: (channelId) => this.broadcastChannelRemove(channelId),
+      sendPostAuthChannelTopUp: (cws, cclient) => this.sendPostAuthChannelTopUp(cws, cclient),
     };
 
     ws.on('message', (raw, isBinary) => {
@@ -137,11 +143,26 @@ class BridgeWebSocketServer {
       this.clients.delete(ws);
     });
 
+    const accessFeature = featureRegistry.features?.get('channel-access');
+    const visibleChannels = accessFeature
+      ? accessFeature.filterVisibleChannels(Array.from(this.channels.values()), null, false)
+      : Array.from(this.channels.values());
     ws.send(JSON.stringify({
       type: 'server_state',
-      channels: Array.from(this.channels.values()),
+      channels: visibleChannels,
       users: Array.from(this.users.values()),
     }));
+  }
+
+  /** Send this specific client the restricted channels it can see but wasn't sent pre-auth. */
+  sendPostAuthChannelTopUp(ws, client) {
+    const accessFeature = featureRegistry.features?.get('channel-access');
+    if (!accessFeature) return;
+    const extra = Array.from(this.channels.values())
+      .filter((ch) => accessFeature.isRestricted(ch.id) && accessFeature.canAccess(ch.id, client.userId, client.isAdmin));
+    if (extra.length > 0) {
+      ws.send(JSON.stringify({ type: 'server_state', channels: extra, users: [] }));
+    }
   }
 
   _broadcastAll(msg) {
@@ -154,10 +175,39 @@ class BridgeWebSocketServer {
   }
 
   _broadcastToChannel(channelId, msg, excludeWs = null) {
+    const accessFeature = featureRegistry.features?.get('channel-access');
+    const restricted = accessFeature ? accessFeature.isRestricted(channelId) : false;
     const data = JSON.stringify(msg);
     for (const [ws, info] of this.clients) {
-      if (ws === excludeWs) continue;
-      if (ws.readyState === WebSocket.OPEN && (info.channelId === channelId || info.channelId === null)) {
+      if (ws === excludeWs || ws.readyState !== WebSocket.OPEN) continue;
+      if (restricted) {
+        if (info.channelId !== channelId) continue; // no null-passthrough for restricted channels
+        if (!accessFeature.canAccess(channelId, info.userId, info.isAdmin)) continue;
+        ws.send(data);
+      } else if (info.channelId === channelId || info.channelId === null) {
+        ws.send(data);
+      }
+    }
+  }
+
+  /** channel_update/channel_remove for a specific channel, filtered to clients who can see it. */
+  broadcastChannelUpdate(channel) {
+    this._broadcastChannelScoped(channel.id, { type: 'channel_update', channel });
+  }
+
+  broadcastChannelRemove(channelId) {
+    this._broadcastChannelScoped(channelId, { type: 'channel_remove', channelId });
+  }
+
+  _broadcastChannelScoped(channelId, msg) {
+    const accessFeature = featureRegistry.features?.get('channel-access');
+    if (!accessFeature || !accessFeature.isRestricted(channelId)) {
+      this._broadcastAll(msg);
+      return;
+    }
+    const data = JSON.stringify(msg);
+    for (const [ws, info] of this.clients) {
+      if (ws.readyState === WebSocket.OPEN && accessFeature.canAccess(channelId, info.userId, info.isAdmin)) {
         ws.send(data);
       }
     }

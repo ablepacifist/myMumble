@@ -101,6 +101,8 @@ async function main() {
     mumble,
     broadcast: (msg) => wsServer._broadcastAll(msg),
     broadcastToChannel: (chId, msg, excludeWs) => wsServer._broadcastToChannel(chId, msg, excludeWs),
+    broadcastChannelUpdate: (channel) => wsServer.broadcastChannelUpdate(channel),
+    broadcastChannelRemove: (channelId) => wsServer.broadcastChannelRemove(channelId),
     getClients: () => wsServer.clients,
     getWebClients: () => wsServer.webClients,
     channels: wsServer.channels,

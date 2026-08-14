@@ -57,3 +57,7 @@ node_modules/
 **/node_modules/
 mumble-client/dist/
 *.log
+
+# Secrets — never track .env files
+.env
+**/.env

@@ -11,6 +11,11 @@ function isSuperUser(username) {
   return config.superUsers.includes((username || '').toLowerCase());
 }
 
+function canAccessChannel(channelId, client) {
+  const accessFeature = featureRegistry.features?.get('channel-access');
+  return !accessFeature || accessFeature.canAccess(channelId, client.userId, client.isAdmin);
+}
+
 /**
  * Handle a message from a web client.
  * @param {WebSocket} ws - The WebSocket connection
@@ -84,6 +89,7 @@ async function handleClientMessage(ws, msg, client, ctx) {
         webClientList.push({ id, username: wc.username, channelId: wc.channelId, inVoice: wc.inVoice, voiceChannelId: wc.voiceChannelId, avatarUrl: wc.avatarUrl });
       }
       ws.send(JSON.stringify({ type: 'web_users', webClients: webClientList }));
+      ctx.sendPostAuthChannelTopUp(ws, client);
 
       // Send unread DM counts on connect
       try {
@@ -189,6 +195,7 @@ async function handleClientMessage(ws, msg, client, ctx) {
         ssoWebClientList.push({ id, username: wc.username, channelId: wc.channelId, inVoice: wc.inVoice, voiceChannelId: wc.voiceChannelId, avatarUrl: wc.avatarUrl });
       }
       ws.send(JSON.stringify({ type: 'web_users', webClients: ssoWebClientList }));
+      ctx.sendPostAuthChannelTopUp(ws, client);
 
       // Send unread DM counts
       try {
@@ -213,6 +220,12 @@ async function handleClientMessage(ws, msg, client, ctx) {
 
       const channelId = msg.channelId || 0;
       const text = msg.text;
+
+      if (!canAccessChannel(channelId, client)) {
+        ws.send(JSON.stringify({ type: 'error', message: 'You do not have access to this channel' }));
+        return;
+      }
+
       const channelName = ctx.channels.get(channelId)?.name || '';
 
       ctx.mumble.sendTextMessage([channelId], `<b>${client.username}:</b> ${text}`);
@@ -286,6 +299,12 @@ async function handleClientMessage(ws, msg, client, ctx) {
       }
 
       const imgChannelId = msg.channelId || 0;
+
+      if (!canAccessChannel(imgChannelId, client)) {
+        ws.send(JSON.stringify({ type: 'error', message: 'You do not have access to this channel' }));
+        return;
+      }
+
       const imgChannelName = ctx.channels.get(imgChannelId)?.name || '';
 
       // Store in Lexicon
@@ -332,8 +351,17 @@ async function handleClientMessage(ws, msg, client, ctx) {
     }
 
     case 'get_history': {
+      if (!client.authenticated) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Not authenticated' }));
+        break;
+      }
+      const historyChannelId = msg.channelId || 0;
+      if (!canAccessChannel(historyChannelId, client)) {
+        ws.send(JSON.stringify({ type: 'error', message: 'You do not have access to this channel' }));
+        break;
+      }
       const limit = msg.limit || 50;
-      const messages = await lexicon.getChannelMessages(msg.channelId || 0, limit, msg.before || null);
+      const messages = await lexicon.getChannelMessages(historyChannelId, limit, msg.before || null);
       ws.send(JSON.stringify({
         type: 'history',
         channelId: msg.channelId,
@@ -345,6 +373,10 @@ async function handleClientMessage(ws, msg, client, ctx) {
 
     case 'join_channel': {
       if (client.authenticated) {
+        if (!canAccessChannel(msg.channelId, client)) {
+          ws.send(JSON.stringify({ type: 'error', message: 'You do not have access to this channel' }));
+          break;
+        }
         client.channelId = msg.channelId;
         ws.send(JSON.stringify({ type: 'joined_channel', channelId: msg.channelId }));
       }
@@ -379,7 +411,7 @@ async function handleClientMessage(ws, msg, client, ctx) {
         // Broadcast the new channel to all clients
         const newCh = { id: newId, name: channelName, parentId };
         ctx.channels.set(newId, newCh);
-        ctx.broadcastAll({ type: 'channel_update', channel: newCh });
+        ctx.broadcastChannelUpdate(newCh);
         ws.send(JSON.stringify({ type: 'channel_created', channel: newCh }));
       } catch (err) {
         console.error(`[WS] Channel create error:`, err.message);
@@ -410,7 +442,9 @@ async function handleClientMessage(ws, msg, client, ctx) {
         console.log(`[WS] Channel ${removeId} deleted by ${client.username} via DB`);
         // Remove from in-memory state and broadcast
         ctx.channels.delete(removeId);
-        ctx.broadcastAll({ type: 'channel_remove', channelId: removeId });
+        const accessFeature = featureRegistry.features?.get('channel-access');
+        if (accessFeature) await accessFeature.clearChannelAccess(removeId);
+        ctx.broadcastChannelRemove(removeId);
       } catch (err) {
         console.error(`[WS] Channel remove error:`, err.message);
         ws.send(JSON.stringify({ type: 'error', message: 'Failed to remove channel: ' + err.message }));

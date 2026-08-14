@@ -13,6 +13,8 @@
   let dialogMode = 'create';           // 'create' | 'edit' — channel dialog mode
   let editingChannelId = null;         // channel id being edited, when dialogMode === 'edit'
   let pendingDiscordLinkForNewChannel = null; // discord channel id to link once create_channel is acked
+  let pendingKnownUsers = [];          // [{userId, username, displayName}] for the restrict-access picker
+  let pendingGrantedUserIds = new Set(); // currently-granted user ids for the channel being edited
   let currentChannelId = 1;  // default to 'general' channel
   let activeDMConversationId = null; // currently open DM conversation
   let dmConversations = [];          // list of DM conversations
@@ -67,6 +69,9 @@
   const channelCategorySelect = $('#channel-category-select');
   const channelVoiceCheck = $('#channel-voice-check');
   const channelDiscordIdInput = $('#channel-discord-id-input');
+  const channelRestrictLabel = $('#channel-restrict-label');
+  const channelRestrictCheck = $('#channel-restrict-check');
+  const channelRestrictUsers = $('#channel-restrict-users');
   const channelDialogStatus = $('#channel-dialog-status');
   const channelSaveBtn  = $('#channel-save-btn');
   const channelCancelBtn = $('#channel-cancel-btn');
@@ -388,6 +393,24 @@
 
       case 'channel_discord_link_result':
         if (!msg.success) alert(`Failed to update Discord link: ${msg.error || 'unknown error'}`);
+        break;
+
+      case 'known_users':
+        pendingKnownUsers = msg.users || [];
+        renderRestrictUserList();
+        break;
+
+      case 'channel_access_state':
+        if (msg.channelId === editingChannelId) {
+          channelRestrictCheck.checked = !!msg.restricted;
+          channelRestrictUsers.classList.toggle('hidden', !msg.restricted);
+          pendingGrantedUserIds = new Set(msg.userIds || []);
+          renderRestrictUserList();
+        }
+        break;
+
+      case 'channel_access_result':
+        if (!msg.success) alert(`Failed to update channel access: ${msg.error || 'unknown error'}`);
         break;
 
       case 'user_update':
@@ -779,6 +802,10 @@
     channelDiscordIdInput.value = '';
     channelDialogStatus.textContent = '';
     channelSaveBtn.textContent = 'Create';
+    // Restricting a channel is only available once it exists (edit mode) — hide it here.
+    channelRestrictLabel.classList.add('hidden');
+    channelRestrictCheck.checked = false;
+    channelRestrictUsers.classList.add('hidden');
     channelDialog.classList.remove('hidden');
     channelNameInput.focus();
     if (parentId !== undefined) channelCategorySelect.value = String(parentId);
@@ -795,8 +822,28 @@
     channelDiscordIdInput.value = ch.discordChannelId || '';
     channelDialogStatus.textContent = '';
     channelSaveBtn.textContent = 'Save';
+    channelRestrictLabel.classList.remove('hidden');
+    channelRestrictCheck.checked = false;
+    pendingKnownUsers = [];
+    pendingGrantedUserIds = new Set();
+    channelRestrictUsers.innerHTML = '<div class="restrict-loading">Loading…</div>';
     channelDialog.classList.remove('hidden');
     channelDiscordIdInput.focus();
+    send({ type: 'get_known_users' });
+    send({ type: 'get_channel_access', channelId: ch.id });
+  }
+
+  function renderRestrictUserList() {
+    if (pendingKnownUsers.length === 0) {
+      channelRestrictUsers.innerHTML = '<div class="restrict-loading">No known users yet.</div>';
+      return;
+    }
+    channelRestrictUsers.innerHTML = pendingKnownUsers.map(u => `
+      <label class="checkbox-label">
+        <input type="checkbox" value="${u.userId}" ${pendingGrantedUserIds.has(u.userId) ? 'checked' : ''}>
+        ${escapeHtml(u.displayName || u.username)}
+      </label>
+    `).join('');
   }
 
   // ── Rendering: Member List (right panel) ─────────────────
@@ -1858,6 +1905,9 @@
 
   // Channel dialog
   channelCancelBtn.addEventListener('click', () => channelDialog.classList.add('hidden'));
+  channelRestrictCheck.addEventListener('change', () => {
+    channelRestrictUsers.classList.toggle('hidden', !channelRestrictCheck.checked);
+  });
   channelSaveBtn.addEventListener('click', () => {
     const discordChannelId = channelDiscordIdInput.value.trim();
     if (discordChannelId && !/^\d{5,25}$/.test(discordChannelId)) {
@@ -1873,6 +1923,11 @@
       send({ type: 'create_channel', name, parentId });
     } else {
       send({ type: 'set_channel_discord_link', channelId: editingChannelId, discordChannelId: discordChannelId || null });
+      const restricted = channelRestrictCheck.checked;
+      const userIds = restricted
+        ? Array.from(channelRestrictUsers.querySelectorAll('input[type=checkbox]:checked')).map(cb => parseInt(cb.value, 10))
+        : [];
+      send({ type: 'set_channel_access', channelId: editingChannelId, restricted, userIds });
     }
     channelDialog.classList.add('hidden');
   });

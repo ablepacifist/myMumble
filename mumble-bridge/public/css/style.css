@@ -347,6 +347,19 @@ a:hover { text-decoration: underline; }
   cursor: pointer;
 }
 
+.restrict-user-list {
+  max-height: 160px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  background: var(--input-bg);
+  border-radius: var(--radius-sm);
+}
+.restrict-user-list.hidden { display: none; }
+.restrict-loading { color: var(--text-muted); font-size: 12px; }
+
 /* ===== USER PANEL (bottom sidebar) ===== */
 .user-panel {
   height: var(--user-panel-height);

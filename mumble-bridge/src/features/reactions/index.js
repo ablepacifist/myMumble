@@ -12,6 +12,8 @@
  * Stores reactions in MySQL, broadcasts updates in real-time.
  */
 
+const featureRegistry = require('../../feature-registry');
+
 class ReactionsFeature {
   constructor() {
     this.name = 'reactions';
@@ -65,6 +67,12 @@ class ReactionsFeature {
       return;
     }
 
+    const accessFeature = featureRegistry.features?.get('channel-access');
+    if (accessFeature && !accessFeature.canAccess(channelId || 0, client.userId, client.isAdmin)) {
+      ws.send(JSON.stringify({ type: 'error', message: 'You do not have access to this channel' }));
+      return;
+    }
+
     // Sanitize emoji — allow unicode emoji or short codes like :thumbsup:
     const cleanEmoji = this._sanitizeEmoji(emoji);
     if (!cleanEmoji) {
@@ -97,6 +105,12 @@ class ReactionsFeature {
   async _removeReaction(ws, client, msg) {
     const { messageId, emoji, channelId } = msg;
     if (!messageId || !emoji) return;
+
+    const accessFeature = featureRegistry.features?.get('channel-access');
+    if (accessFeature && !accessFeature.canAccess(channelId || 0, client.userId, client.isAdmin)) {
+      ws.send(JSON.stringify({ type: 'error', message: 'You do not have access to this channel' }));
+      return;
+    }
 
     const cleanEmoji = this._sanitizeEmoji(emoji);
     if (!cleanEmoji) return;
