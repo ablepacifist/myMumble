@@ -18,6 +18,8 @@
     "test:features": "node tests/test-features-phase1.js",
     "test:channel-access": "node tests/test-channel-access.js",
     "test:channel-access:live": "node tests/test-channel-access-live.js",
+    "test:phase4": "node tests/test-features-phase4.js",
+    "test:message-features:live": "node tests/test-message-features-live.js",
     "build:react": "cd public/react-src && npm run build"
   },
   "keywords": [

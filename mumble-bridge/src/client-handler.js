@@ -6,6 +6,7 @@ const lexicon = require('./lexicon-client');
 const config = require('./config');
 const featureRegistry = require('./feature-registry');
 const richText = require('./features/rich-text');
+const { findMessageWindow } = require('./message-window');
 
 function isSuperUser(username) {
   return config.superUsers.includes((username || '').toLowerCase());
@@ -14,6 +15,13 @@ function isSuperUser(username) {
 function canAccessChannel(channelId, client) {
   const accessFeature = featureRegistry.features?.get('channel-access');
   return !accessFeature || accessFeature.canAccess(channelId, client.userId, client.isAdmin);
+}
+
+/** Merge real pin status (from the bridge-local sidecar table) into a list of Lexicon message rows. */
+async function attachPinInfo(messages) {
+  const pinFeature = featureRegistry.features?.get('pinned-messages');
+  if (!pinFeature || !messages || messages.length === 0) return messages;
+  return pinFeature.attachPinInfo(messages);
 }
 
 /**
@@ -220,6 +228,7 @@ async function handleClientMessage(ws, msg, client, ctx) {
 
       const channelId = msg.channelId || 0;
       const text = msg.text;
+      const replyToId = /^[0-9]+$/.test(String(msg.replyToMessageId)) ? String(msg.replyToMessageId) : null;
 
       if (!canAccessChannel(channelId, client)) {
         ws.send(JSON.stringify({ type: 'error', message: 'You do not have access to this channel' }));
@@ -239,6 +248,7 @@ async function handleClientMessage(ws, msg, client, ctx) {
           userId: client.userId || 0,
           username: client.username,
           content: text,
+          replyToId,
         });
       } catch (err) {
         console.error(`[Lexicon] Message store failed: ${err.message}`);
@@ -254,6 +264,7 @@ async function handleClientMessage(ws, msg, client, ctx) {
         html: richText.formatRichText(text),
         timestamp: new Date().toISOString(),
         id: msgId,
+        replyToId,
       });
 
       // Process @mentions (async, non-blocking)
@@ -365,9 +376,68 @@ async function handleClientMessage(ws, msg, client, ctx) {
       ws.send(JSON.stringify({
         type: 'history',
         channelId: msg.channelId,
-        messages,
+        messages: await attachPinInfo(messages),
         _isRefresh: !!msg._isRefresh,
       }));
+      break;
+    }
+
+    case 'jump_to_message': {
+      if (!client.authenticated) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Not authenticated' }));
+        break;
+      }
+      const jumpChannelId = msg.channelId || 0;
+      const targetId = msg.messageId;
+      if (!targetId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'messageId is required' }));
+        break;
+      }
+      if (!canAccessChannel(jumpChannelId, client)) {
+        ws.send(JSON.stringify({ type: 'jump_to_message_result', channelId: jumpChannelId, messageId: targetId, found: false, reason: 'no_access' }));
+        break;
+      }
+      const result = await findMessageWindow(lexicon, jumpChannelId, targetId);
+      if (!result.found) {
+        ws.send(JSON.stringify({ type: 'jump_to_message_result', channelId: jumpChannelId, messageId: targetId, found: false, reason: 'not_found' }));
+        break;
+      }
+      ws.send(JSON.stringify({
+        type: 'jump_to_message_result',
+        channelId: jumpChannelId,
+        messageId: targetId,
+        found: true,
+        messages: await attachPinInfo(result.messages),
+      }));
+      break;
+    }
+
+    case 'search_messages': {
+      if (!client.authenticated) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Not authenticated' }));
+        break;
+      }
+      const query = (msg.query || '').trim();
+      if (!query) {
+        ws.send(JSON.stringify({ type: 'search_results', query, results: [] }));
+        break;
+      }
+      const scopedChannelId = msg.channelId != null ? msg.channelId : -1;
+      if (scopedChannelId !== -1 && !canAccessChannel(scopedChannelId, client)) {
+        ws.send(JSON.stringify({ type: 'search_results', query, results: [] }));
+        break;
+      }
+      let raw = [];
+      try {
+        raw = await lexicon.searchMessages(query, scopedChannelId);
+      } catch (err) {
+        console.error(`[Search] Lexicon search failed: ${err.message}`);
+      }
+      raw = Array.isArray(raw) ? raw.slice(0, 200) : [];
+      const results = raw
+        .filter((m) => canAccessChannel(m.channelId != null ? m.channelId : 0, client))
+        .slice(0, 50);
+      ws.send(JSON.stringify({ type: 'search_results', query, results }));
       break;
     }
 
@@ -444,6 +514,8 @@ async function handleClientMessage(ws, msg, client, ctx) {
         ctx.channels.delete(removeId);
         const accessFeature = featureRegistry.features?.get('channel-access');
         if (accessFeature) await accessFeature.clearChannelAccess(removeId);
+        const pinFeature = featureRegistry.features?.get('pinned-messages');
+        if (pinFeature) await pinFeature.deleteChannel(removeId).catch(() => {});
         ctx.broadcastChannelRemove(removeId);
       } catch (err) {
         console.error(`[WS] Channel remove error:`, err.message);
