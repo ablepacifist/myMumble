@@ -14,6 +14,8 @@
  *   - Don't send typing back to the typer
  */
 
+const featureRegistry = require('../../feature-registry');
+
 class TypingFeature {
   constructor() {
     this.name = 'typing';
@@ -34,6 +36,13 @@ class TypingFeature {
     if (!client.authenticated) return;
 
     const channelId = msg.channelId ?? client.channelId ?? 0;
+    const accessFeature = featureRegistry.features?.get('channel-access');
+    if (accessFeature && !accessFeature.canAccess(channelId, client.userId, client.isAdmin)) {
+      if (msg.type === 'typing_start') {
+        ws.send(JSON.stringify({ type: 'error', message: 'You do not have access to this channel' }));
+      }
+      return;
+    }
     const key = `${client.username}:${channelId}`;
 
     if (msg.type === 'typing_start') {

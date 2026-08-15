@@ -4,7 +4,6 @@
 
 const lexicon = require('./lexicon-client');
 const featureRegistry = require('./feature-registry');
-const config = require('./config');
 
 /**
  * Set up listeners on the Mumble connection to relay events to web clients.
@@ -12,8 +11,10 @@ const config = require('./config');
  * @param {object} state - Shared server state { channels, users, ownSession }
  * @param {Function} broadcastAll - Broadcast to all web clients
  * @param {Function} broadcastToChannel - Broadcast to a specific channel
+ * @param {Function} broadcastChannelUpdate - Broadcast a channel_update, filtered by channel access
+ * @param {Function} broadcastChannelRemove - Broadcast a channel_remove, filtered by channel access
  */
-function setupMumbleListeners(mumble, state, broadcastAll, broadcastToChannel) {
+function setupMumbleListeners(mumble, state, broadcastAll, broadcastToChannel, broadcastChannelUpdate, broadcastChannelRemove) {
   mumble.on('ServerSync', (msg) => {
     state.ownSession = msg.session;
     // Initial sync done — the server replays existing users right after we
@@ -25,18 +26,21 @@ function setupMumbleListeners(mumble, state, broadcastAll, broadcastToChannel) {
   mumble.on('ChannelState', (msg) => {
     const existing = state.channels.get(msg.channelId);
     const ch = {
+      ...existing,
       id: msg.channelId,
       name: msg.name || (existing ? existing.name : ''),
       parentId: msg.parent !== undefined ? msg.parent : (existing ? existing.parentId : 0),
       description: msg.description || '',
     };
     state.channels.set(msg.channelId, ch);
-    broadcastAll({ type: 'channel_update', channel: ch });
+    broadcastChannelUpdate(ch);
   });
 
   mumble.on('ChannelRemove', (msg) => {
     state.channels.delete(msg.channelId);
-    broadcastAll({ type: 'channel_remove', channelId: msg.channelId });
+    const accessFeature = featureRegistry.features?.get('channel-access');
+    if (accessFeature) accessFeature.clearChannelAccess(msg.channelId).catch(() => {});
+    broadcastChannelRemove(msg.channelId);
   });
 
   mumble.on('UserState', (msg) => {
@@ -137,14 +141,12 @@ function setupMumbleListeners(mumble, state, broadcastAll, broadcastToChannel) {
         }).catch(() => {});
       }
 
-      // Relay to Discord if this is the configured sync channel.
-      if (chId === config.discord.syncMumbleChannelId) {
-        const discordFeature = featureRegistry.features?.get('discord-sync');
-        if (discordFeature) {
-          discordFeature.getAvatarUrlFor(sender.name).then((avatarUrl) => {
-            discordFeature.relayToDiscord({ username: sender.name, avatarUrl, text: rawText });
-          }).catch(() => {});
-        }
+      // Relay to Discord if this Mumble channel has a Discord link.
+      const discordFeature = featureRegistry.features?.get('discord-sync');
+      if (discordFeature && discordFeature.isLinked(chId)) {
+        discordFeature.getAvatarUrlFor(sender.name).then((avatarUrl) => {
+          discordFeature.relayToDiscord({ mumbleChannelId: chId, username: sender.name, avatarUrl, text: rawText });
+        }).catch(() => {});
       }
     }
   });
