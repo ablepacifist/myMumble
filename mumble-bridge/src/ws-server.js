@@ -104,16 +104,19 @@ class BridgeWebSocketServer {
       try {
         const msg = JSON.parse(raw.toString());
 
-        // 'command' type needs special handling (emitted as event for bot engine)
+        // 'command' type needs special handling — routed directly into the bot engine.
         if (msg.type === 'command' && clientInfo.authenticated) {
-          this.emit && this.emit('bot_command', {
-            command: msg.command,
-            args: msg.args || [],
-            userId: clientInfo.userId,
-            username: clientInfo.username,
-            channelId: clientInfo.channelId || msg.channelId || 0,
-            ws,
-          });
+          if (this.botEngine) {
+            const argsSuffix = (msg.args && msg.args.length) ? ' ' + msg.args.join(' ') : '';
+            const raw = `${config.botPrefix}${msg.command}${argsSuffix}`;
+            const chId = clientInfo.channelId || 0;
+            // senderChannelId must be the user's actual VOICE channel (not their text-view
+            // channel) — music should follow "whichever voice channel you're in," and a web
+            // user only has a Mumble voice connection at all once they've started voice.
+            const webClient = clientInfo.webClientId ? this.webClients.get(clientInfo.webClientId) : null;
+            const senderChannelId = webClient && webClient.inVoice ? webClient.voiceChannelId : null;
+            this.botEngine._handleCommand(raw, clientInfo.username, clientInfo.userId, chId, senderChannelId);
+          }
           return;
         }
 
