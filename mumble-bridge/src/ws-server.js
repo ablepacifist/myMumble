@@ -135,13 +135,23 @@ class BridgeWebSocketServer {
       if (clientInfo.voicePeerId) {
         this.voiceBridge.stopSession(clientInfo.voicePeerId);
       }
+      // The presence map is keyed by user, not by socket, so a reconnecting client
+      // overwrites its own entry. If this close handler runs after that (a dropped
+      // socket plus a fast reconnect is enough), an unguarded delete removes the
+      // *live* entry and tells everyone the user left while they are still here.
+      // Only tear down presence when the entry still belongs to this socket.
       if (clientInfo.webClientId) {
-        this.webClients.delete(clientInfo.webClientId);
-        this._broadcastAll({
-          type: 'web_user_leave',
-          id: clientInfo.webClientId,
-          username: clientInfo.username,
-        });
+        const entry = this.webClients.get(clientInfo.webClientId);
+        if (entry && entry.ws === ws) {
+          this.webClients.delete(clientInfo.webClientId);
+          this._broadcastAll({
+            type: 'web_user_leave',
+            id: clientInfo.webClientId,
+            username: clientInfo.username,
+          });
+        } else {
+          console.log(`[WS] Stale close for ${clientInfo.webClientId}; presence kept`);
+        }
       }
       this.clients.delete(ws);
     });
