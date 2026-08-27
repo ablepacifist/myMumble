@@ -9,6 +9,7 @@ const VoiceBridge = require('./voice-bridge');
 const { createHttpServer } = require('./http-server');
 const { setupMumbleListeners } = require('./mumble-relay');
 const { handleClientMessage } = require('./client-handler');
+const featureRegistry = require('./feature-registry');
 
 class BridgeWebSocketServer {
   /**
@@ -57,6 +58,8 @@ class BridgeWebSocketServer {
       state,
       (msg) => this._broadcastAll(msg),
       (chId, msg, excludeWs) => this._broadcastToChannel(chId, msg, excludeWs),
+      (channel) => this.broadcastChannelUpdate(channel),
+      (channelId) => this.broadcastChannelRemove(channelId),
     );
 
     return new Promise((resolve) => {
@@ -81,6 +84,9 @@ class BridgeWebSocketServer {
       webClients: this.webClients,
       broadcastAll: (msg) => this._broadcastAll(msg),
       broadcastToChannel: (chId, msg, excludeWs) => this._broadcastToChannel(chId, msg, excludeWs),
+      broadcastChannelUpdate: (channel) => this.broadcastChannelUpdate(channel),
+      broadcastChannelRemove: (channelId) => this.broadcastChannelRemove(channelId),
+      sendPostAuthChannelTopUp: (cws, cclient) => this.sendPostAuthChannelTopUp(cws, cclient),
     };
 
     ws.on('message', (raw, isBinary) => {
@@ -98,16 +104,19 @@ class BridgeWebSocketServer {
       try {
         const msg = JSON.parse(raw.toString());
 
-        // 'command' type needs special handling (emitted as event for bot engine)
+        // 'command' type needs special handling — routed directly into the bot engine.
         if (msg.type === 'command' && clientInfo.authenticated) {
-          this.emit && this.emit('bot_command', {
-            command: msg.command,
-            args: msg.args || [],
-            userId: clientInfo.userId,
-            username: clientInfo.username,
-            channelId: clientInfo.channelId || msg.channelId || 0,
-            ws,
-          });
+          if (this.botEngine) {
+            const argsSuffix = (msg.args && msg.args.length) ? ' ' + msg.args.join(' ') : '';
+            const raw = `${config.botPrefix}${msg.command}${argsSuffix}`;
+            const chId = clientInfo.channelId || 0;
+            // senderChannelId must be the user's actual VOICE channel (not their text-view
+            // channel) — music should follow "whichever voice channel you're in," and a web
+            // user only has a Mumble voice connection at all once they've started voice.
+            const webClient = clientInfo.webClientId ? this.webClients.get(clientInfo.webClientId) : null;
+            const senderChannelId = webClient && webClient.inVoice ? webClient.voiceChannelId : null;
+            this.botEngine._handleCommand(raw, clientInfo.username, clientInfo.userId, chId, senderChannelId);
+          }
           return;
         }
 
@@ -126,22 +135,47 @@ class BridgeWebSocketServer {
       if (clientInfo.voicePeerId) {
         this.voiceBridge.stopSession(clientInfo.voicePeerId);
       }
+      // The presence map is keyed by user, not by socket, so a reconnecting client
+      // overwrites its own entry. If this close handler runs after that (a dropped
+      // socket plus a fast reconnect is enough), an unguarded delete removes the
+      // *live* entry and tells everyone the user left while they are still here.
+      // Only tear down presence when the entry still belongs to this socket.
       if (clientInfo.webClientId) {
-        this.webClients.delete(clientInfo.webClientId);
-        this._broadcastAll({
-          type: 'web_user_leave',
-          id: clientInfo.webClientId,
-          username: clientInfo.username,
-        });
+        const entry = this.webClients.get(clientInfo.webClientId);
+        if (entry && entry.ws === ws) {
+          this.webClients.delete(clientInfo.webClientId);
+          this._broadcastAll({
+            type: 'web_user_leave',
+            id: clientInfo.webClientId,
+            username: clientInfo.username,
+          });
+        } else {
+          console.log(`[WS] Stale close for ${clientInfo.webClientId}; presence kept`);
+        }
       }
       this.clients.delete(ws);
     });
 
+    const accessFeature = featureRegistry.features?.get('channel-access');
+    const visibleChannels = accessFeature
+      ? accessFeature.filterVisibleChannels(Array.from(this.channels.values()), null, false)
+      : Array.from(this.channels.values());
     ws.send(JSON.stringify({
       type: 'server_state',
-      channels: Array.from(this.channels.values()),
+      channels: visibleChannels,
       users: Array.from(this.users.values()),
     }));
+  }
+
+  /** Send this specific client the restricted channels it can see but wasn't sent pre-auth. */
+  sendPostAuthChannelTopUp(ws, client) {
+    const accessFeature = featureRegistry.features?.get('channel-access');
+    if (!accessFeature) return;
+    const extra = Array.from(this.channels.values())
+      .filter((ch) => accessFeature.isRestricted(ch.id) && accessFeature.canAccess(ch.id, client.userId, client.isAdmin));
+    if (extra.length > 0) {
+      ws.send(JSON.stringify({ type: 'server_state', channels: extra, users: [] }));
+    }
   }
 
   _broadcastAll(msg) {
@@ -154,10 +188,39 @@ class BridgeWebSocketServer {
   }
 
   _broadcastToChannel(channelId, msg, excludeWs = null) {
+    const accessFeature = featureRegistry.features?.get('channel-access');
+    const restricted = accessFeature ? accessFeature.isRestricted(channelId) : false;
     const data = JSON.stringify(msg);
     for (const [ws, info] of this.clients) {
-      if (ws === excludeWs) continue;
-      if (ws.readyState === WebSocket.OPEN && (info.channelId === channelId || info.channelId === null)) {
+      if (ws === excludeWs || ws.readyState !== WebSocket.OPEN) continue;
+      if (restricted) {
+        if (info.channelId !== channelId) continue; // no null-passthrough for restricted channels
+        if (!accessFeature.canAccess(channelId, info.userId, info.isAdmin)) continue;
+        ws.send(data);
+      } else if (info.channelId === channelId || info.channelId === null) {
+        ws.send(data);
+      }
+    }
+  }
+
+  /** channel_update/channel_remove for a specific channel, filtered to clients who can see it. */
+  broadcastChannelUpdate(channel) {
+    this._broadcastChannelScoped(channel.id, { type: 'channel_update', channel });
+  }
+
+  broadcastChannelRemove(channelId) {
+    this._broadcastChannelScoped(channelId, { type: 'channel_remove', channelId });
+  }
+
+  _broadcastChannelScoped(channelId, msg) {
+    const accessFeature = featureRegistry.features?.get('channel-access');
+    if (!accessFeature || !accessFeature.isRestricted(channelId)) {
+      this._broadcastAll(msg);
+      return;
+    }
+    const data = JSON.stringify(msg);
+    for (const [ws, info] of this.clients) {
+      if (ws.readyState === WebSocket.OPEN && accessFeature.canAccess(channelId, info.userId, info.isAdmin)) {
         ws.send(data);
       }
     }

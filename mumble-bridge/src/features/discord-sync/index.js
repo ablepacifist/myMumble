@@ -339,7 +339,7 @@ class DiscordSyncFeature {
       const ch = this.deps.channels.get(mumbleChannelId);
       if (ch) {
         ch.discordChannelId = discordChannelId;
-        this.deps.broadcast({ type: 'channel_update', channel: ch });
+        this.deps.broadcastChannelUpdate(ch);
       }
 
       return { ok: true };
@@ -366,7 +366,7 @@ class DiscordSyncFeature {
       const ch = this.deps.channels.get(mumbleChannelId);
       if (ch) {
         delete ch.discordChannelId;
-        this.deps.broadcast({ type: 'channel_update', channel: ch });
+        this.deps.broadcastChannelUpdate(ch);
       }
 
       return { ok: true };

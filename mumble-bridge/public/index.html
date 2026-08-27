@@ -55,6 +55,8 @@
         <input type="text" id="channel-name-input" placeholder="channel-name" maxlength="50">
         <label class="checkbox-label"><input type="checkbox" id="channel-voice-check"> Voice Channel</label>
         <input type="text" id="channel-discord-id-input" placeholder="Discord channel ID (optional)" maxlength="32">
+        <label id="channel-restrict-label" class="checkbox-label"><input type="checkbox" id="channel-restrict-check"> Restrict this channel</label>
+        <div id="channel-restrict-users" class="restrict-user-list hidden"></div>
         <div id="channel-dialog-status" class="dialog-status"></div>
         <div class="dialog-actions">
           <button id="channel-save-btn" class="btn btn-small btn-primary">Create</button>
@@ -101,6 +103,8 @@
             <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.89 2 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>
             <span id="notif-badge" class="notif-badge hidden">0</span>
           </button>
+          <button id="pins-btn" class="header-btn" title="Pinned Messages">📌</button>
+          <button id="search-btn" class="header-btn" title="Search messages">🔍</button>
           <button id="header-voice-btn" class="header-btn" title="Join voice chat">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
           </button>
@@ -120,6 +124,19 @@
         <div id="notif-list" class="notif-list"></div>
       </div>
 
+      <!-- Pinned messages dropdown panel -->
+      <div id="pins-panel" class="notif-panel pins-panel hidden">
+        <div class="notif-panel-header"><span>Pinned Messages</span></div>
+        <div id="pins-list" class="notif-list"></div>
+      </div>
+
+      <!-- Search dropdown panel -->
+      <div id="search-panel" class="notif-panel search-panel hidden">
+        <div class="notif-panel-header"><span>Search Messages</span></div>
+        <input type="text" id="search-input" placeholder="Search..." maxlength="200">
+        <div id="search-results-list" class="notif-list"></div>
+      </div>
+
       <!-- Main content area (messages + optional member list) -->
       <div class="content-body">
         <!-- Messages area -->
@@ -129,6 +146,11 @@
           </div>
 
           <!-- Input Bar -->
+          <button id="jump-to-latest-btn" class="jump-to-latest-btn hidden">↓ Jump to latest</button>
+          <div id="reply-preview-bar" class="reply-preview-bar hidden">
+            <span>↩ Replying to <strong id="reply-preview-bar-author"></strong>: <span id="reply-preview-bar-snippet"></span></span>
+            <button id="reply-preview-bar-cancel" title="Cancel reply">&times;</button>
+          </div>
           <div id="typing-indicator"></div>
           <div id="typing-indicator-mount"></div>
           <div id="input-bar">

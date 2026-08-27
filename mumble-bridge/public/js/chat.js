@@ -13,6 +13,8 @@
   let dialogMode = 'create';           // 'create' | 'edit' — channel dialog mode
   let editingChannelId = null;         // channel id being edited, when dialogMode === 'edit'
   let pendingDiscordLinkForNewChannel = null; // discord channel id to link once create_channel is acked
+  let pendingKnownUsers = [];          // [{userId, username, displayName}] for the restrict-access picker
+  let pendingGrantedUserIds = new Set(); // currently-granted user ids for the channel being edited
   let currentChannelId = 1;  // default to 'general' channel
   let activeDMConversationId = null; // currently open DM conversation
   let dmConversations = [];          // list of DM conversations
@@ -31,6 +33,9 @@
   let memberListVisible = true;
   let lastMessageAuthor = null;     // for grouping messages
   let lastMessageTime = 0;
+  const messageContentCache = new Map(); // messageId -> { username, text, timestamp, messageType, attachment }
+  let pendingJump = null;           // { channelId, messageId } awaiting jump_to_message_result
+  let pendingReplyTarget = null;    // { messageId, username, preview } while composing a reply
 
   // Avatar cache
   const avatarCache = {};
@@ -61,12 +66,27 @@
   const messageInput    = $('#message-input');
   const sendBtn         = $('#send-btn');
   const statusDot       = $('#connection-status');
+  const jumpToLatestBtn = $('#jump-to-latest-btn');
+  const replyPreviewBar = $('#reply-preview-bar');
+  const replyPreviewBarAuthor = $('#reply-preview-bar-author');
+  const replyPreviewBarSnippet = $('#reply-preview-bar-snippet');
+  const replyPreviewBarCancel = $('#reply-preview-bar-cancel');
+  const searchBtn       = $('#search-btn');
+  const searchPanel     = $('#search-panel');
+  const searchInput     = $('#search-input');
+  const searchResultsList = $('#search-results-list');
+  const pinsBtn         = $('#pins-btn');
+  const pinsPanel       = $('#pins-panel');
+  const pinsList        = $('#pins-list');
   const channelDialog   = $('#channel-dialog');
   const channelDialogTitle = $('#channel-dialog-title');
   const channelNameInput = $('#channel-name-input');
   const channelCategorySelect = $('#channel-category-select');
   const channelVoiceCheck = $('#channel-voice-check');
   const channelDiscordIdInput = $('#channel-discord-id-input');
+  const channelRestrictLabel = $('#channel-restrict-label');
+  const channelRestrictCheck = $('#channel-restrict-check');
+  const channelRestrictUsers = $('#channel-restrict-users');
   const channelDialogStatus = $('#channel-dialog-status');
   const channelSaveBtn  = $('#channel-save-btn');
   const channelCancelBtn = $('#channel-cancel-btn');
@@ -390,6 +410,24 @@
         if (!msg.success) alert(`Failed to update Discord link: ${msg.error || 'unknown error'}`);
         break;
 
+      case 'known_users':
+        pendingKnownUsers = msg.users || [];
+        renderRestrictUserList();
+        break;
+
+      case 'channel_access_state':
+        if (msg.channelId === editingChannelId) {
+          channelRestrictCheck.checked = !!msg.restricted;
+          channelRestrictUsers.classList.toggle('hidden', !msg.restricted);
+          pendingGrantedUserIds = new Set(msg.userIds || []);
+          renderRestrictUserList();
+        }
+        break;
+
+      case 'channel_access_result':
+        if (!msg.success) alert(`Failed to update channel access: ${msg.error || 'unknown error'}`);
+        break;
+
       case 'user_update':
         if (msg.user) {
           users.set(msg.user.session, msg.user);
@@ -477,24 +515,7 @@
               if (tA !== tB) return tA - tB;
               return (a.id || 0) - (b.id || 0);
             })
-            .forEach(m => {
-              const histMsg = {
-                id: m.id || null,
-                username: m.senderName || m.username || 'Unknown',
-                text: m.content || m.text || '',
-                timestamp: m.createdAt || m.sentAt || m.timestamp || new Date().toISOString(),
-                source: 'history',
-                messageType: m.messageType || 'TEXT',
-              };
-              // Attach image metadata if present
-              if (m.attachment) {
-                histMsg.type = 'image';
-                histMsg.attachment = m.attachment;
-                histMsg.caption = m.content || m.text || '';
-                histMsg.text = histMsg.caption; // keep text for dedup
-              }
-              addChatMessage(histMsg, true);
-            });
+            .forEach(m => addChatMessage(mapHistoryMessage(m), true));
 
           // Load reactions for all history messages that have IDs
           const historyIds = newMsgs.filter(m => m.id).map(m => m.id);
@@ -505,6 +526,30 @@
         if (!msg._isRefresh) scrollToBottom();
         break;
       }
+
+      case 'jump_to_message_result':
+        handleJumpResult(msg);
+        break;
+
+      case 'search_results':
+        renderSearchResults(msg);
+        break;
+
+      case 'pin_added':
+        handlePinAdded(msg);
+        break;
+
+      case 'pin_removed':
+        handlePinRemoved(msg);
+        break;
+
+      case 'pinned_messages':
+        renderPinsList(msg);
+        break;
+
+      case 'pin_result':
+        if (!msg.success) alert(`Failed to update pin: ${msg.error || 'unknown error'}`);
+        break;
 
       case 'joined_channel':
         currentChannelId = msg.channelId;
@@ -779,6 +824,10 @@
     channelDiscordIdInput.value = '';
     channelDialogStatus.textContent = '';
     channelSaveBtn.textContent = 'Create';
+    // Restricting a channel is only available once it exists (edit mode) — hide it here.
+    channelRestrictLabel.classList.add('hidden');
+    channelRestrictCheck.checked = false;
+    channelRestrictUsers.classList.add('hidden');
     channelDialog.classList.remove('hidden');
     channelNameInput.focus();
     if (parentId !== undefined) channelCategorySelect.value = String(parentId);
@@ -795,8 +844,28 @@
     channelDiscordIdInput.value = ch.discordChannelId || '';
     channelDialogStatus.textContent = '';
     channelSaveBtn.textContent = 'Save';
+    channelRestrictLabel.classList.remove('hidden');
+    channelRestrictCheck.checked = false;
+    pendingKnownUsers = [];
+    pendingGrantedUserIds = new Set();
+    channelRestrictUsers.innerHTML = '<div class="restrict-loading">Loading…</div>';
     channelDialog.classList.remove('hidden');
     channelDiscordIdInput.focus();
+    send({ type: 'get_known_users' });
+    send({ type: 'get_channel_access', channelId: ch.id });
+  }
+
+  function renderRestrictUserList() {
+    if (pendingKnownUsers.length === 0) {
+      channelRestrictUsers.innerHTML = '<div class="restrict-loading">No known users yet.</div>';
+      return;
+    }
+    channelRestrictUsers.innerHTML = pendingKnownUsers.map(u => `
+      <label class="checkbox-label">
+        <input type="checkbox" value="${u.userId}" ${pendingGrantedUserIds.has(u.userId) ? 'checked' : ''}>
+        ${escapeHtml(u.displayName || u.username)}
+      </label>
+    `).join('');
   }
 
   // ── Rendering: Member List (right panel) ─────────────────
@@ -861,11 +930,12 @@
   // ── Join Channel ─────────────────────────────────────────
   let currentVoiceChannelId = null;
 
-  function joinChannel(chId) {
+  function joinChannel(chId, opts = {}) {
     currentChannelId = chId;
     activeDMConversationId = null; // Exit DM mode
     lastMessageAuthor = null;
     lastMessageTime = 0;
+    jumpToLatestBtn.classList.add('hidden');
 
     if (chId === ACTIVITY_CHANNEL_ID) {
       updateChannelHeader();
@@ -887,11 +957,60 @@
     updateChannelHeader();
     renderChannels();
     renderDMList();
+    if (!opts.skipHistory) {
+      messagesEl.innerHTML = '';
+      seenMessageIds.clear();
+      send({ type: 'get_history', channelId: chId, limit: 50 });
+      startPolling();
+    }
+    sidebar.classList.remove('open');
+  }
+
+  // ── Jump to message (search results, reply previews) ─────
+  function jumpToMessage(channelId, messageId) {
+    const targetId = String(messageId);
+    const doLookup = () => {
+      const existing = messagesEl.querySelector(`[data-message-id="${targetId}"]`);
+      if (existing) { highlightAndScroll(existing); return; }
+      pendingJump = { channelId: String(channelId), messageId: targetId };
+      send({ type: 'jump_to_message', channelId, messageId: targetId });
+    };
+    if (String(channelId) !== String(currentChannelId)) {
+      joinChannel(channelId, { skipHistory: true });
+    }
+    doLookup();
+  }
+
+  function highlightAndScroll(el) {
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.add('message-highlight');
+    setTimeout(() => el.classList.remove('message-highlight'), 2000);
+  }
+
+  function handleJumpResult(msg) {
+    if (!pendingJump || String(msg.channelId) !== pendingJump.channelId || String(msg.messageId) !== pendingJump.messageId) return;
+    const targetId = pendingJump.messageId;
+    pendingJump = null;
+    if (!msg.found) {
+      addSystemMessage('That message could not be found — it may be too old to load, or was deleted.');
+      return;
+    }
     messagesEl.innerHTML = '';
     seenMessageIds.clear();
-    send({ type: 'get_history', channelId: chId, limit: 50 });
-    startPolling();
-    sidebar.classList.remove('open');
+    lastMessageAuthor = null;
+    lastMessageTime = 0;
+    msg.messages
+      .slice()
+      .sort((a, b) => {
+        const tA = new Date(a.createdAt || a.sentAt || a.timestamp || 0).getTime();
+        const tB = new Date(b.createdAt || b.sentAt || b.timestamp || 0).getTime();
+        if (tA !== tB) return tA - tB;
+        return (a.id || 0) - (b.id || 0);
+      })
+      .forEach(m => addChatMessage(mapHistoryMessage(m), true));
+    const targetEl = messagesEl.querySelector(`[data-message-id="${targetId}"]`);
+    if (targetEl) highlightAndScroll(targetEl);
+    jumpToLatestBtn.classList.remove('hidden');
   }
 
   function joinVoiceChannel(chId) {
@@ -915,6 +1034,28 @@
   // ── Chat Messages (Discord-style grouping) ───────────────
   function dedupKey(name, text) {
     return (name || '').toLowerCase() + '|' + stripHtml(text || '').toLowerCase().trim();
+  }
+
+  // Turns a raw Lexicon message row (from get_history or jump_to_message_result) into
+  // the shape addChatMessage expects. Shared so jump results render identically to history.
+  function mapHistoryMessage(m) {
+    const histMsg = {
+      id: m.id || null,
+      username: m.senderName || m.username || 'Unknown',
+      text: m.content || m.text || '',
+      timestamp: m.createdAt || m.sentAt || m.timestamp || new Date().toISOString(),
+      source: 'history',
+      messageType: m.messageType || 'TEXT',
+      replyToId: m.replyToId || null,
+      isPinned: !!m.isPinned,
+    };
+    if (m.attachment) {
+      histMsg.type = 'image';
+      histMsg.attachment = m.attachment;
+      histMsg.caption = m.content || m.text || '';
+      histMsg.text = histMsg.caption; // keep text for dedup
+    }
+    return histMsg;
   }
 
   function addChatMessage(msg, isHistory) {
@@ -979,7 +1120,38 @@
     // Group: same author within 7 minutes = compact message
     const showHeader = (author !== lastMessageAuthor || (timeMs - lastMessageTime) > 7 * 60 * 1000);
     const msgId = msg.id ? String(msg.id) : key;
-    const reactionsHtml = `<div class="reactions-row" data-reactions-for="${escapeHtml(msgId)}"><button class="reaction-add-btn" title="Add reaction" onclick="document.dispatchEvent(new CustomEvent('reaction:open-picker',{detail:{messageId:'${escapeHtml(msgId)}'}}))">+</button></div>`;
+
+    if (msg.id) {
+      messageContentCache.set(msgId, {
+        username: author,
+        text: msg.text || msg.content || msg.caption || '',
+        timestamp: time,
+        messageType: isImageMsg ? (msg.messageType || (msg.attachment?.mimeType === 'image/gif' ? 'GIF' : 'IMAGE')) : 'TEXT',
+        attachment: isImageMsg ? (msg.attachment || { fileUrl: msg.fileUrl, thumbnailUrl: msg.thumbnailUrl, originalFilename: msg.originalFilename, mimeType: msg.mimeType, width: msg.width, height: msg.height }) : null,
+      });
+    }
+
+    const pinBtnHtml = isAdmin
+      ? `<button class="pin-btn${msg.isPinned ? ' is-pinned' : ''}" title="${msg.isPinned ? 'Unpin' : 'Pin'} message" data-message-id="${escapeHtml(msgId)}">📌</button>`
+      : '';
+    const reactionsHtml = `<div class="reactions-row" data-reactions-for="${escapeHtml(msgId)}">
+      <button class="reply-btn" title="Reply" data-message-id="${escapeHtml(msgId)}">↩</button>
+      ${pinBtnHtml}
+      <button class="reaction-add-btn" title="Add reaction" onclick="document.dispatchEvent(new CustomEvent('reaction:open-picker',{detail:{messageId:'${escapeHtml(msgId)}'}}))">+</button>
+    </div>`;
+
+    let replyPreviewHtml = '';
+    if (msg.replyToId) {
+      const cached = messageContentCache.get(String(msg.replyToId));
+      const targetInDom = messagesEl.querySelector(`[data-message-id="${msg.replyToId}"]`);
+      if (cached || targetInDom) {
+        const replyAuthor = cached?.username || 'Unknown';
+        const replyText = (cached?.text || '').slice(0, 100);
+        replyPreviewHtml = `<div class="reply-preview" data-jump-to="${escapeHtml(msg.replyToId)}">↩ <strong>${escapeHtml(replyAuthor)}</strong> ${escapeHtml(replyText)}</div>`;
+      } else {
+        replyPreviewHtml = `<div class="reply-preview reply-preview-missing" data-jump-to="${escapeHtml(msg.replyToId)}">↩ Replying to a message — click to view</div>`;
+      }
+    }
 
     const div = document.createElement('div');
     div.className = 'message' + (showHeader ? ' has-header' : '');
@@ -993,6 +1165,7 @@
             <span class="message-author">${escapeHtml(author)}</span>
             <span class="message-timestamp">${formatTime(time)}</span>
           </div>
+          ${replyPreviewHtml}
           ${contentHtml}
           ${reactionsHtml}
         </div>
@@ -1001,6 +1174,7 @@
       div.innerHTML = `
         <div class="message-avatar"></div>
         <div class="message-body">
+          ${replyPreviewHtml}
           ${contentHtml}
           ${reactionsHtml}
         </div>
@@ -1222,6 +1396,8 @@
     notifBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       const opening = notifPanel.classList.contains('hidden');
+      if (pinsPanel) pinsPanel.classList.add('hidden');
+      if (searchPanel) searchPanel.classList.add('hidden');
       notifPanel.classList.toggle('hidden');
       if (opening) send({ type: 'get_notifications', limit: 50 });
     });
@@ -1263,6 +1439,183 @@
     notifItems = msg.notifications || [];
     updateNotifBadge();
     renderNotifList();
+  }
+
+  // ── Reply threads ──────────────────────────────────────────
+  function startReply(messageId) {
+    const cached = messageContentCache.get(String(messageId));
+    pendingReplyTarget = {
+      messageId: String(messageId),
+      username: cached?.username || 'Unknown',
+      preview: (cached?.text || '').slice(0, 120),
+    };
+    renderReplyPreviewBar();
+    messageInput.focus();
+  }
+
+  function cancelReply() {
+    pendingReplyTarget = null;
+    renderReplyPreviewBar();
+  }
+
+  function renderReplyPreviewBar() {
+    if (!pendingReplyTarget) {
+      replyPreviewBar.classList.add('hidden');
+      return;
+    }
+    replyPreviewBarAuthor.textContent = pendingReplyTarget.username;
+    replyPreviewBarSnippet.textContent = pendingReplyTarget.preview;
+    replyPreviewBar.classList.remove('hidden');
+  }
+
+  if (replyPreviewBarCancel) replyPreviewBarCancel.addEventListener('click', cancelReply);
+
+  // Event delegation: reply / pin buttons and reply-preview "jump to" clicks
+  messagesEl.addEventListener('click', (e) => {
+    const replyBtn = e.target.closest('.reply-btn');
+    if (replyBtn) { startReply(replyBtn.dataset.messageId); return; }
+
+    const pinBtn = e.target.closest('.pin-btn');
+    if (pinBtn) {
+      const id = pinBtn.dataset.messageId;
+      if (pinBtn.classList.contains('is-pinned')) {
+        send({ type: 'unpin_message', channelId: currentChannelId, messageId: id });
+      } else {
+        const cached = messageContentCache.get(id) || {};
+        send({
+          type: 'pin_message',
+          channelId: currentChannelId,
+          messageId: id,
+          username: cached.username,
+          content: cached.text,
+          messageType: cached.messageType,
+          attachment: cached.attachment,
+        });
+      }
+      return;
+    }
+
+    const preview = e.target.closest('.reply-preview');
+    if (preview) { jumpToMessage(currentChannelId, preview.dataset.jumpTo); return; }
+  });
+
+  if (jumpToLatestBtn) {
+    jumpToLatestBtn.addEventListener('click', () => joinChannel(currentChannelId));
+  }
+
+  // ── Pinned messages ─────────────────────────────────────────
+  function renderPinsList(msg) {
+    if (!pinsList) return;
+    const pins = msg.pins || [];
+    if (pins.length === 0) {
+      pinsList.innerHTML = '<div class="notif-empty">No pinned messages yet.</div>';
+      return;
+    }
+    pinsList.innerHTML = '';
+    pins.forEach((p) => {
+      const item = document.createElement('div');
+      item.className = 'pin-item';
+      const when = p.pinnedAt ? new Date(p.pinnedAt).toLocaleString() : '';
+      item.innerHTML = `
+        <span class="pin-item-meta">${escapeHtml(p.username)} · ${escapeHtml(when)}</span>
+        <span class="pin-item-text">${escapeHtml((p.content || '').slice(0, 200))}</span>
+        ${isAdmin ? `<button class="pin-item-unpin" data-message-id="${escapeHtml(p.messageId)}">Unpin</button>` : ''}
+      `;
+      item.addEventListener('click', (e) => {
+        if (e.target.closest('.pin-item-unpin')) {
+          e.stopPropagation();
+          send({ type: 'unpin_message', channelId: p.channelId, messageId: p.messageId });
+          return;
+        }
+        jumpToMessage(p.channelId, p.messageId);
+        pinsPanel.classList.add('hidden');
+      });
+      pinsList.appendChild(item);
+    });
+  }
+
+  function handlePinAdded(msg) {
+    const el = messagesEl.querySelector(`[data-message-id="${msg.pin.messageId}"] .pin-btn`);
+    if (el) { el.classList.add('is-pinned'); el.title = 'Unpin message'; }
+    if (!pinsPanel.classList.contains('hidden') && String(msg.channelId) === String(currentChannelId)) {
+      send({ type: 'get_pinned_messages', channelId: currentChannelId });
+    }
+  }
+
+  function handlePinRemoved(msg) {
+    const el = messagesEl.querySelector(`[data-message-id="${msg.messageId}"] .pin-btn`);
+    if (el) { el.classList.remove('is-pinned'); el.title = 'Pin message'; }
+    if (!pinsPanel.classList.contains('hidden') && String(msg.channelId) === String(currentChannelId)) {
+      send({ type: 'get_pinned_messages', channelId: currentChannelId });
+    }
+  }
+
+  if (pinsBtn) {
+    pinsBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const opening = pinsPanel.classList.contains('hidden');
+      notifPanel.classList.add('hidden');
+      searchPanel.classList.add('hidden');
+      pinsPanel.classList.toggle('hidden');
+      if (opening) send({ type: 'get_pinned_messages', channelId: currentChannelId });
+    });
+    document.addEventListener('click', (e) => {
+      if (!pinsPanel.classList.contains('hidden') &&
+          !pinsPanel.contains(e.target) && e.target !== pinsBtn) {
+        pinsPanel.classList.add('hidden');
+      }
+    });
+  }
+
+  // ── Message search ──────────────────────────────────────────
+  function renderSearchResults(msg) {
+    if (!searchResultsList) return;
+    const results = msg.results || [];
+    if (results.length === 0) {
+      searchResultsList.innerHTML = msg.query ? '<div class="notif-empty">No results.</div>' : '';
+      return;
+    }
+    searchResultsList.innerHTML = '';
+    results.forEach((r) => {
+      const item = document.createElement('div');
+      item.className = 'search-result-item';
+      const when = r.createdAt ? new Date(r.createdAt).toLocaleString() : '';
+      const chanName = channels.get(r.channelId)?.name || `#${r.channelId}`;
+      item.innerHTML = `
+        <span class="search-result-meta">${escapeHtml(r.username || 'Unknown')} in #${escapeHtml(chanName)} · ${escapeHtml(when)}</span>
+        <span class="search-result-text">${escapeHtml((r.content || '').slice(0, 200))}</span>
+      `;
+      item.addEventListener('click', () => {
+        jumpToMessage(r.channelId, r.id);
+        searchPanel.classList.add('hidden');
+      });
+      searchResultsList.appendChild(item);
+    });
+  }
+
+  if (searchBtn) {
+    searchBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const opening = searchPanel.classList.contains('hidden');
+      notifPanel.classList.add('hidden');
+      pinsPanel.classList.add('hidden');
+      searchPanel.classList.toggle('hidden');
+      if (opening) searchInput.focus();
+    });
+    document.addEventListener('click', (e) => {
+      if (!searchPanel.classList.contains('hidden') &&
+          !searchPanel.contains(e.target) && e.target !== searchBtn) {
+        searchPanel.classList.add('hidden');
+      }
+    });
+  }
+  if (searchInput) {
+    searchInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        const query = searchInput.value.trim();
+        if (query) send({ type: 'search_messages', query });
+      }
+    });
   }
 
   // ── Notification Preferences (synced with Lexicon) ───────
@@ -1480,10 +1833,11 @@
       const parts = text.slice(1).split(/\s+/);
       send({ type: 'command', command: parts[0], args: parts.slice(1) });
     }
-    send({ type: 'text', text, channelId: currentChannelId });
+    send({ type: 'text', text, channelId: currentChannelId, replyToMessageId: pendingReplyTarget?.messageId || null });
     messageInput.value = '';
     messageInput.focus();
     sendTypingStop();
+    cancelReply();
   }
 
   // Request DM conversations on auth
@@ -1858,6 +2212,9 @@
 
   // Channel dialog
   channelCancelBtn.addEventListener('click', () => channelDialog.classList.add('hidden'));
+  channelRestrictCheck.addEventListener('change', () => {
+    channelRestrictUsers.classList.toggle('hidden', !channelRestrictCheck.checked);
+  });
   channelSaveBtn.addEventListener('click', () => {
     const discordChannelId = channelDiscordIdInput.value.trim();
     if (discordChannelId && !/^\d{5,25}$/.test(discordChannelId)) {
@@ -1873,6 +2230,11 @@
       send({ type: 'create_channel', name, parentId });
     } else {
       send({ type: 'set_channel_discord_link', channelId: editingChannelId, discordChannelId: discordChannelId || null });
+      const restricted = channelRestrictCheck.checked;
+      const userIds = restricted
+        ? Array.from(channelRestrictUsers.querySelectorAll('input[type=checkbox]:checked')).map(cb => parseInt(cb.value, 10))
+        : [];
+      send({ type: 'set_channel_access', channelId: editingChannelId, restricted, userIds });
     }
     channelDialog.classList.add('hidden');
   });

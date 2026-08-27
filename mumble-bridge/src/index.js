@@ -1,6 +1,7 @@
 const MumbleConnection = require('./mumble-connection');
 const BridgeWebSocketServer = require('./ws-server');
 const BotEngine = require('./bot-engine');
+const musicBot = require('./music-bot');
 const { initBridgeDatabase, getBridgePool } = require('./database');
 const lexicon = require('./lexicon-client');
 const featureRegistry = require('./feature-registry');
@@ -92,6 +93,10 @@ async function main() {
   console.log('[Boot] Starting bot engine...');
   const bot = new BotEngine(mumble, wsServer);
   bot.init();
+  wsServer.botEngine = bot;
+
+  // Music bot — renders Lexicon's shared Livestream state into Mumble voice
+  musicBot.init(wsServer);
 
   // 5. Load feature modules (rich-text, typing, etc.)
   console.log('[Boot] Loading feature modules...');
@@ -101,6 +106,8 @@ async function main() {
     mumble,
     broadcast: (msg) => wsServer._broadcastAll(msg),
     broadcastToChannel: (chId, msg, excludeWs) => wsServer._broadcastToChannel(chId, msg, excludeWs),
+    broadcastChannelUpdate: (channel) => wsServer.broadcastChannelUpdate(channel),
+    broadcastChannelRemove: (channelId) => wsServer.broadcastChannelRemove(channelId),
     getClients: () => wsServer.clients,
     getWebClients: () => wsServer.webClients,
     channels: wsServer.channels,
@@ -120,6 +127,7 @@ async function main() {
   const shutdown = () => {
     console.log('\n[Shutdown] Shutting down...');
     featureRegistry.cleanup();
+    musicBot.cleanup();
     clearInterval(pingInterval);
     mumble.disconnect();
     if (wsServer.wss) wsServer.wss.close();

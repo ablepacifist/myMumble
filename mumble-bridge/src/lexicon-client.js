@@ -279,11 +279,11 @@ class LexiconClient {
   /**
    * Store a text message in Lexicon's HSQLDB.
    */
-  async storeMessage({ channelId, channelName, userId, username, content, messageType = 'TEXT', mediaFileId = null }) {
+  async storeMessage({ channelId, channelName, userId, username, content, messageType = 'TEXT', mediaFileId = null, replyToId = null }) {
     const res = await fetch(`${this.baseUrl}/api/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channelId, channelName, userId, username, content, messageType, mediaFileId }),
+      body: JSON.stringify({ channelId, channelName, userId, username, content, messageType, mediaFileId, replyToId }),
     });
     if (!res.ok) {
       console.error(`[Lexicon] Failed to store message: ${res.status}`);

@@ -27,6 +27,15 @@ const BUILD_VERSION = Date.now().toString(36);
 
 const MAX_AVATAR_SIZE = 2 * 1024 * 1024; // 2MB
 const AVATAR_DIR_NAME = 'uploads/avatars';
+
+// Origins allowed to call this API cross-origin. The localhost entries are the
+// Android (Capacitor) shell, which serves the bundled client from its own local
+// origin; the rest is the normal site.
+const ALLOWED_ORIGINS = [
+  /^https?:\/\/localhost(:\d+)?$/,
+  /^capacitor:\/\/localhost$/,
+  /^https:\/\/([a-z0-9-]+\.)?alex-dyakin\.com$/,
+];
 const ALLOWED_AVATAR_TYPES = {
   'image/jpeg': '.jpg',
   'image/png': '.png',
@@ -47,6 +56,26 @@ function createHttpServer(publicDir) {
 
   return http.createServer(async (req, res) => {
     const urlPath = req.url.split('?')[0];
+
+    // ── CORS ───────────────────────────────────
+    // The Android app bundles this client and serves it from the WebView's own
+    // local origin, so its calls here are cross-origin. Browsers hitting the
+    // real site are same-origin and unaffected by any of this.
+    const origin = req.headers.origin;
+    if (origin && ALLOWED_ORIGINS.some((allowed) => allowed.test(origin))) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+      res.setHeader('Vary', 'Origin');
+    }
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, {
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Max-Age': '86400',
+      });
+      res.end();
+      return;
+    }
 
     // ── API Routes ─────────────────────────────
     // GET /api/avatar/:username
