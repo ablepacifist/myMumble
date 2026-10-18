@@ -1,6 +1,7 @@
 const config = require('./config');
 const lexicon = require('./lexicon-client');
 const { getBridgePool } = require('./database');
+const musicBot = require('./music-bot');
 
 /**
  * Bot engine — parses ! commands from text messages.
@@ -26,7 +27,9 @@ class BotEngine {
       if (text.startsWith(this.prefix)) {
         const sender = this.wsServer.users.get(msg.actor);
         const channelIds = msg.channelId || [];
-        this._handleCommand(text, sender?.name || 'Unknown', 0, channelIds[0] || 0);
+        // sender.channelId (live UserState-tracked) is the sender's actual current
+        // channel — more reliable than the text message's declared target channel(s).
+        this._handleCommand(text, sender?.name || 'Unknown', 0, channelIds[0] || 0, sender?.channelId ?? null);
       }
     });
 
@@ -39,8 +42,9 @@ class BotEngine {
    * @param {string} username
    * @param {number} userId
    * @param {number} channelId
+   * @param {number|null} senderChannelId - the invoking user's actual current voice channel, if known
    */
-  async _handleCommand(raw, username, userId, channelId) {
+  async _handleCommand(raw, username, userId, channelId, senderChannelId = null) {
     const parts = raw.slice(this.prefix.length).trim().split(/\s+/);
     const command = parts[0]?.toLowerCase();
     const args = parts.slice(1);
@@ -64,11 +68,19 @@ class BotEngine {
           break;
 
         case 'play':
-          response = await this._play(args, userId);
+          response = await this._play(args, userId, senderChannelId);
           break;
 
         case 'skip':
           response = await this._skip(userId);
+          break;
+
+        case 'volume':
+          response = this._volume(args);
+          break;
+
+        case 'stop':
+          response = await this._stop();
           break;
 
         case 'search':
@@ -103,9 +115,24 @@ class BotEngine {
       );
     } catch { /* ignore logging errors */ }
 
-    // Send response back to Mumble channel
+    // Send response back to Mumble channel, and directly to web clients too —
+    // mumble-relay.js drops every TextMessage sent by our own connection
+    // (actor === ownSession), so without this web chat never sees bot replies.
     if (response) {
       this.mumble.sendTextMessage([channelId], response);
+      try {
+        this.wsServer._broadcastToChannel(channelId, {
+          type: 'text',
+          channelId,
+          username: 'Bot',
+          text: response.replace(/<[^>]+>/g, ''),
+          html: response,
+          source: 'bot',
+          timestamp: new Date().toISOString(),
+        });
+      } catch (err) {
+        console.error(`[Bot] WS broadcast failed: ${err.message}`);
+      }
     }
   }
 
@@ -117,8 +144,10 @@ class BotEngine {
 <b>${this.prefix}channels</b> — List channels<br/>
 <b>${this.prefix}np</b> — Now playing (music)<br/>
 <b>${this.prefix}queue</b> — Show music queue<br/>
-<b>${this.prefix}play &lt;search&gt;</b> — Search and queue a song<br/>
+<b>${this.prefix}play &lt;search&gt;</b> — Search, queue, and play a song in your voice channel<br/>
 <b>${this.prefix}skip</b> — Vote to skip current song<br/>
+<b>${this.prefix}volume [0-150]</b> — Show or set music volume<br/>
+<b>${this.prefix}stop</b> — Stop music and leave voice<br/>
 <b>${this.prefix}search &lt;query&gt;</b> — Search media library`;
   }
 
@@ -145,7 +174,7 @@ class BotEngine {
     return text;
   }
 
-  async _play(args, userId) {
+  async _play(args, userId, senderChannelId) {
     if (args.length === 0) return `Usage: <b>${this.prefix}play &lt;search term&gt;</b>`;
 
     const query = args.join(' ');
@@ -153,14 +182,30 @@ class BotEngine {
 
     if (!results.length) return `❌ No results for: <b>${query}</b>`;
 
-    // Queue the first result
+    // Queue the first result. Note: this doesn't necessarily start playing
+    // immediately — it may land behind other queued items.
     const media = results[0];
+    const title = media.title || media.filename;
     try {
       await lexicon.queueToLivestream(userId, media.id);
-      return `✅ Queued: <b>${media.title || media.filename}</b>`;
     } catch (err) {
       return `❌ Failed to queue: ${err.message}`;
     }
+
+    if (senderChannelId === null || senderChannelId === undefined) {
+      return `✅ Queued: <b>${title}</b> — join a voice channel to hear it play!`;
+    }
+
+    let result;
+    try {
+      result = await musicBot.playInChannel(senderChannelId);
+    } catch (err) {
+      result = { ok: false, error: err.message };
+    }
+    if (!result.ok) {
+      return `✅ Queued: <b>${title}</b> (⚠️ couldn't join voice: ${result.error})`;
+    }
+    return result.moved ? `✅ Queued: <b>${title}</b> — 🎵 moved to your channel!` : `✅ Queued: <b>${title}</b>`;
   }
 
   async _skip(userId) {
@@ -170,6 +215,19 @@ class BotEngine {
     } catch (err) {
       return `❌ Skip failed: ${err.message}`;
     }
+  }
+
+  _volume(args) {
+    if (args.length === 0) return `🔊 Current volume: <b>${musicBot.getVolumePercent()}%</b>`;
+    const n = parseInt(args[0], 10);
+    if (!Number.isFinite(n)) return `Usage: <b>${this.prefix}volume [0-150]</b>`;
+    const applied = musicBot.setVolume(n);
+    return `🔊 Volume set to <b>${applied}%</b>`;
+  }
+
+  async _stop() {
+    await musicBot.stop();
+    return '⏹️ Stopped and left the voice channel.';
   }
 
   async _searchMedia(args) {

@@ -17,6 +17,15 @@ Under the hood, there are 3 services working together:
 > Browser → WebSocket → Bridge → Mumble → Bridge → WebSocket → Browser.
 > The only external connection is Cloudflare Tunnel for HTTPS access.
 
+> **Cloudflare Tunnel only covers the web path (HTTP/WSS on port 3080).**
+> Native Mumble desktop clients connect straight to port 64738 with raw
+> TCP+UDP, which Cloudflare Tunnel can't carry — that traffic depends on
+> this server's public IP and router port-forwarding, full stop. If this
+> server ever relocates, everything else (this bridge, the tunnel itself)
+> reconnects on its own with zero config changes, but native-client voice
+> is the one piece that needs a manual new port-forward rule and a new
+> address handed out to anyone using the native Mumble app.
+
 ### How Voice Works
 
 ```
@@ -172,7 +181,7 @@ npm run test:e2e      # Two-client voice end-to-end
 | **Mumble port** | `64738` |
 | **Bridge port** | `3080` |
 | **MySQL database** | `mumble_bridge` (user: `mumble`, pass: `mumble_pass_2026`) |
-| **Lexicon API** | `http://147.185.221.24:15856` |
+| **Lexicon API** | `https://api.alex-dyakin.com` (Cloudflare, permanent — do not use the old PlayIt IP, it drifts and won't survive their relocation) |
 | **Bridge Lexicon account** | `mumble-bridge` / `bridge-service-2026` |
 
 ---
