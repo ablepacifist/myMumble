@@ -34,14 +34,20 @@ class LexiconClient {
    * Called once on startup.
    */
   async loginAsService() {
+    const { serviceUsername, servicePassword } = config.lexicon;
+    if (!serviceUsername || !servicePassword) {
+      console.error('[Lexicon] LEXICON_SERVICE_USER / LEXICON_SERVICE_PASSWORD are not set in .env; ' +
+        'the bridge cannot log in to Lexicon.');
+      return null;
+    }
     try {
-      const result = await this.login('mumble-bridge', 'bridge-service-2026');
+      const result = await this.login(serviceUsername, servicePassword);
       this.serviceUserId = result.id || result.playerId;
       console.log(`[Lexicon] Bridge service logged in as user ID ${this.serviceUserId}`);
       return result;
     } catch (err) {
       console.error(`[Lexicon] Bridge service login failed: ${err.message}`);
-      console.error('         Make sure the mumble-bridge user exists in Lexicon.');
+      console.error('         Check LEXICON_SERVICE_USER / LEXICON_SERVICE_PASSWORD in .env and that the user exists in Lexicon.');
       return null;
     }
   }

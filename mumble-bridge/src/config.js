@@ -18,6 +18,9 @@ module.exports = {
   },
   lexicon: {
     apiUrl: process.env.LEXICON_API_URL || 'http://localhost:36568',
+    // Login the bridge uses for its own Lexicon API calls. Set both in .env (never commit them).
+    serviceUsername: process.env.LEXICON_SERVICE_USER || '',
+    servicePassword: process.env.LEXICON_SERVICE_PASSWORD || '',
   },
   discord: {
     botToken: process.env.DISCORD_BOT_TOKEN || '',

@@ -180,9 +180,9 @@ npm run test:e2e      # Two-client voice end-to-end
 | **Server Public IP** | `46.110.37.62` |
 | **Mumble port** | `64738` |
 | **Bridge port** | `3080` |
-| **MySQL database** | `mumble_bridge` (user: `mumble`, pass: `mumble_pass_2026`) |
+| **MySQL database** | `mumble_bridge` (user: `mumble`; password is `MYSQL_PASSWORD` in `.env`) |
 | **Lexicon API** | `https://api.alex-dyakin.com` (Cloudflare, permanent — do not use the old PlayIt IP, it drifts and won't survive their relocation) |
-| **Bridge Lexicon account** | `mumble-bridge` / `bridge-service-2026` |
+| **Bridge Lexicon account** | `LEXICON_SERVICE_USER` / `LEXICON_SERVICE_PASSWORD` in `.env` |
 
 ---
 
