@@ -1,5 +1,18 @@
-const fetch = require('node-fetch');
+const nodeFetch = require('node-fetch');
 const config = require('./config');
+
+/**
+ * fetch() that identifies this bridge to Lexicon with the shared service token.
+ * Lexicon only lets the bridge use the routes it needs, and only for requests carrying the token.
+ * The token is attached solely to requests for the Lexicon API host, never anywhere else.
+ */
+function fetch(url, options = {}) {
+  const token = config.lexicon.serviceToken;
+  if (!token || typeof url !== 'string' || !url.startsWith(config.lexicon.apiUrl)) {
+    return nodeFetch(url, options);
+  }
+  return nodeFetch(url, { ...options, headers: { ...(options.headers || {}), 'X-Service-Token': token } });
+}
 
 /**
  * Client for the Lexicon API.

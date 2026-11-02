@@ -21,6 +21,8 @@ module.exports = {
     // Login the bridge uses for its own Lexicon API calls. Set both in .env (never commit them).
     serviceUsername: process.env.LEXICON_SERVICE_USER || '',
     servicePassword: process.env.LEXICON_SERVICE_PASSWORD || '',
+    // Shared secret Lexicon accepts from this bridge as "X-Service-Token". Must match LEXICON_SERVICE_TOKEN on aragorn.
+    serviceToken: process.env.LEXICON_SERVICE_TOKEN || '',
   },
   discord: {
     botToken: process.env.DISCORD_BOT_TOKEN || '',
