@@ -7,6 +7,7 @@
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
     "test": "node tests/run-all.js",
+    "test:security": "node --test \"tests/security/*.test.js\"",
     "test:http": "node tests/test-http-server.js",
     "test:ws": "node tests/test-ws-connect.js",
     "test:ws:quality": "node tests/test-ws-quality.js",

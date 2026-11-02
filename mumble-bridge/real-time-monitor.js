@@ -12,6 +12,7 @@
 
 const fs = require('fs');
 const path = require('path');
+require('dotenv').config();
 const http = require('http');
 const readline = require('readline');
 
@@ -36,7 +37,14 @@ let lastCheckTime = 0;
 async function fetchViaHttp(endpoint) {
   return new Promise((resolve, reject) => {
     const url = `http://${HTTP_URL}/api/diag/${endpoint}`;
-    http.get(url, (res) => {
+    // /api/diag/* needs the bridge's DIAG_TOKEN (set DIAG_TOKEN in the environment or in .env on the bridge machine)
+    const token = process.env.DIAG_TOKEN;
+    http.get(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} }, (res) => {
+      if (res.statusCode === 401 || res.statusCode === 403) {
+        reject(new Error(`The bridge refused the request (HTTP ${res.statusCode}). Set DIAG_TOKEN to the value of DIAG_TOKEN on the bridge.`));
+        res.resume();
+        return;
+      }
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {

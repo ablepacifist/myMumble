@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>IDIOTS PLAY GAMES — Voice Chat</title>
   <link rel="stylesheet" href="/css/style.css?v=3">
-  <link rel="stylesheet" href="/react/style.css?v=1" onerror="">
+  <link rel="stylesheet" href="/react/style.css?v=1">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 </head>
@@ -17,11 +17,12 @@
       <h1>IDIOTS PLAY GAMES</h1>
       <p class="login-subtitle">Voice &amp; Text Chat</p>
       <div class="login-form">
-        <input type="text" id="username-input" placeholder="Enter your username" autocomplete="off" maxlength="30">
+        <input type="text" id="username-input" placeholder="Lexicon username" autocomplete="username" maxlength="64">
+        <input type="password" id="password-input" placeholder="Lexicon password" autocomplete="current-password" maxlength="256">
         <button id="login-btn" class="btn btn-primary">Connect</button>
       </div>
       <div id="login-error" class="error-msg hidden"></div>
-      <p class="login-info">No password needed — just pick a name and jump in!</p>
+      <p class="login-info" id="login-info">Sign in with your Lexicon username and password.</p>
     </div>
   </div>
 
@@ -302,6 +303,6 @@
     <div id="reactions-mount"></div>
   <script src="/js/rich-text-renderer.js?v=1"></script>
   <script src="/js/chat.js?v=3"></script>
-  <script src="/react/features-bundle.js?v=2" defer onerror=""></script>
+  <script src="/react/features-bundle.js?v=2" defer></script>
 </body>
 </html>

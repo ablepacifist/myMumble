@@ -1,10 +1,19 @@
 /**
  * HTTP static file server + Avatar API + Diagnostics API.
  * Serves the public/ directory with cache busting.
+ *
+ * Who may do what:
+ *   open      static files, GET /api/avatar/:name, GET /api/chat/files/:id (images are loaded by <img> tags,
+ *             which cannot send a token), GET /api/push/vapid-key (a public key)
+ *   signed in avatar upload/remove and chat image upload, always as the signed-in user
+ *             (identity comes from the session token, never from the form)
+ *   admin     /api/diag/*  (admin session, or the optional DIAG_TOKEN for command-line tools)
  */
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const config = require('./config');
+const sec = require('./security');
 const { getAvatarPath, setAvatarPath, removeAvatarPath } = require('./database');
 
 const MIME_TYPES = {
@@ -26,43 +35,172 @@ const MIME_TYPES = {
 const BUILD_VERSION = Date.now().toString(36);
 
 const MAX_AVATAR_SIZE = 2 * 1024 * 1024; // 2MB
+const MAX_CHAT_FILE_SIZE = 8 * 1024 * 1024; // 8MB
+const MULTIPART_OVERHEAD = 16 * 1024; // form fields and boundaries around the file
 const AVATAR_DIR_NAME = 'uploads/avatars';
+const EXT_FOR_TYPE = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp' };
 
-// Origins allowed to call this API cross-origin. The localhost entries are the
-// Android (Capacitor) shell, which serves the bundled client from its own local
-// origin; the rest is the normal site.
-const ALLOWED_ORIGINS = [
-  /^https?:\/\/localhost(:\d+)?$/,
-  /^capacitor:\/\/localhost$/,
-  /^https:\/\/([a-z0-9-]+\.)?alex-dyakin\.com$/,
-];
-const ALLOWED_AVATAR_TYPES = {
-  'image/jpeg': '.jpg',
-  'image/png': '.png',
-  'image/gif': '.gif',
-  'image/webp': '.webp',
-};
+// Image uploads are small and rare for a person; this stops a stolen session from filling the disk.
+const uploadLimiter = new sec.RateLimiter(20, 60 * 1000);
+
+/** Content-Security-Policy for the web client (see CSP_MODE). Scripts only from this server. */
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+  "font-src 'self' https://fonts.gstatic.com",
+  "img-src 'self' data: blob: https:",
+  "media-src 'self' blob:",
+  "connect-src 'self' ws: wss:",
+  "worker-src 'self' blob:",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'self'",
+  "frame-ancestors 'self'",
+].join('; ');
+
+function securityHeaders(req, res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  const mode = config.security.cspMode;
+  if (mode === 'enforce') res.setHeader('Content-Security-Policy', CSP);
+  else if (mode !== 'off') res.setHeader('Content-Security-Policy-Report-Only', CSP);
+  // HTTPS-only hint, sent when the request really came over HTTPS (through the Cloudflare tunnel)
+  if (sec.isLoopback(req.socket.remoteAddress) && req.headers['x-forwarded-proto'] === 'https') {
+    res.setHeader('Strict-Transport-Security', 'max-age=15552000');
+  }
+}
+
+function sendJson(res, status, body) {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(body));
+}
+
+/** Read a request body, giving up (413) as soon as it grows past maxBytes. Resolves to a Buffer, or null if too big. */
+function readBody(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    let tooBig = false;
+    req.on('data', (chunk) => {
+      total += chunk.length;
+      if (total > maxBytes) { tooBig = true; return; }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(tooBig ? null : Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+/** The plain text fields of a parsed multipart body (everything that is not a file). */
+function formFields(parts) {
+  const fields = {};
+  for (const p of parts) if (p.name && !p.filename && p.data) fields[p.name] = p.data.toString('utf8').trim();
+  return fields;
+}
+
+/** Multipart parts of a request, or null after answering 4xx. */
+async function readMultipart(req, res, maxFileBytes) {
+  const contentType = req.headers['content-type'] || '';
+  const boundaryMatch = contentType.match(/boundary=([^;]+)/);
+  if (!contentType.includes('multipart/form-data') || !boundaryMatch) {
+    sendJson(res, 400, { error: 'Expected multipart/form-data' });
+    return null;
+  }
+  const body = await readBody(req, maxFileBytes + MULTIPART_OVERHEAD);
+  if (!body) {
+    sendJson(res, 413, { error: 'File too large' });
+    return null;
+  }
+  return parseMultipart(body, '--' + boundaryMatch[1].replace(/^"|"$/g, ''));
+}
 
 /**
  * Create an HTTP server that serves static files from publicDir.
  * Also handles /api/avatar/* routes for profile pictures.
  * @param {string} publicDir - Absolute path to the public/ directory
+ * @param {{sessions: import('./security').SessionStore}} deps
  * @returns {http.Server}
  */
-function createHttpServer(publicDir) {
-  const avatarDir = path.join(publicDir, AVATAR_DIR_NAME);
-  // Ensure avatar dir exists
+function createHttpServer(publicDir, { sessions } = {}) {
+  const root = path.resolve(publicDir);
+  const avatarDir = path.join(root, AVATAR_DIR_NAME);
   fs.mkdirSync(avatarDir, { recursive: true });
 
-  return http.createServer(async (req, res) => {
-    const urlPath = req.url.split('?')[0];
+  /**
+   * Who is calling. Returns { record } for a valid session token, { service: true } for Lexicon (see below),
+   * { legacy: true } for a request with no token while ALLOW_LEGACY_APP_UPLOADS is on (the caller then names itself in
+   * the form, as the old Android app does), or null after answering 401. A request that does send a token is always
+   * held to it.
+   *
+   * Lexicon's avatar proxy has already checked who the player is, so on the avatar routes (allowService) it may prove
+   * itself with the shared X-Service-Token and name the player in the form. The token is the same secret the bridge
+   * sends to Lexicon; it is never accepted on the chat-upload or diagnostics routes.
+   */
+  async function authorise(req, res, { allowService = false } = {}) {
+    const offered = req.headers['x-service-token'];
+    if (offered !== undefined) {
+      const expected = config.lexicon.serviceToken;
+      if (allowService && expected && typeof offered === 'string' && sec.safeEqual(offered, expected)) {
+        return { service: true };
+      }
+      sendJson(res, 401, { error: 'Sign in required' });
+      return null;
+    }
+    if (req.headers.authorization) {
+      const token = sec.bearerToken(req);
+      const record = token && sessions ? await sessions.get(token) : null;
+      if (record) return { record };
+    } else if (config.security.allowLegacyAppUploads) {
+      return { legacy: true };
+    }
+    sendJson(res, 401, { error: 'Sign in required' });
+    return null;
+  }
+
+  /** The identity to act as: the session, or (Lexicon proxy / legacy app) the name and id in the form. Answers 401 if neither. */
+  function identity(auth, fields, res) {
+    if (auth.record) return auth.record;
+    const name = typeof fields.username === 'string' ? fields.username.trim() : '';
+    if (!name || name.length > 64) {
+      sendJson(res, 401, { error: 'Sign in required' });
+      return null;
+    }
+    return { userId: sec.toId(fields.userId), loginName: name, displayName: name, strong: false, legacy: true };
+  }
+
+  /** Admin session or the DIAG_TOKEN; answers 401/403 and returns false otherwise. */
+  async function requireDiagAccess(req, res) {
+    const token = sec.bearerToken(req);
+    if (!token) { sendJson(res, 401, { error: 'Sign in required' }); return false; }
+    if (config.security.diagToken && sec.safeEqual(token, config.security.diagToken)) return true;
+    const record = sessions ? await sessions.get(token) : null;
+    if (!record) { sendJson(res, 401, { error: 'Sign in required' }); return false; }
+    if (!sec.isAdminIdentity(record, { superUsers: config.superUsers, nameOnlyAdmin: config.security.nameOnlyAdmin })) {
+      sendJson(res, 403, { error: 'Admin only' });
+      return false;
+    }
+    return true;
+  }
+
+  async function handle(req, res) {
+    let urlPath;
+    try {
+      urlPath = decodeURIComponent(req.url.split('?')[0]);
+    } catch (_) {
+      res.writeHead(400, { 'Content-Type': 'text/plain' });
+      res.end('Bad Request');
+      return;
+    }
+    securityHeaders(req, res);
 
     // ── CORS ───────────────────────────────────
     // The Android app bundles this client and serves it from the WebView's own
     // local origin, so its calls here are cross-origin. Browsers hitting the
     // real site are same-origin and unaffected by any of this.
     const origin = req.headers.origin;
-    if (origin && ALLOWED_ORIGINS.some((allowed) => allowed.test(origin))) {
+    if (origin && sec.ALLOWED_ORIGINS.some((allowed) => allowed.test(origin))) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Access-Control-Allow-Credentials', 'true');
       res.setHeader('Vary', 'Origin');
@@ -80,105 +218,84 @@ function createHttpServer(publicDir) {
     // ── API Routes ─────────────────────────────
     // GET /api/avatar/:username
     if (req.method === 'GET' && urlPath.startsWith('/api/avatar/')) {
-      const username = decodeURIComponent(urlPath.slice('/api/avatar/'.length));
+      const username = urlPath.slice('/api/avatar/'.length);
       try {
         const avatarPath = await getAvatarPath(username);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ avatarUrl: avatarPath || '/uploads/avatars/default.jpg' }));
+        sendJson(res, 200, { avatarUrl: sec.safeAvatarUrl(avatarPath) });
       } catch (e) {
-        console.error('[Avatar] GET error:', e);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Internal error' }));
+        console.error('[Avatar] GET error:', e.message);
+        sendJson(res, 500, { error: 'Internal error' });
       }
       return;
     }
 
-    // POST /api/avatar/upload  (multipart/form-data)
+    // POST /api/avatar/upload  (multipart/form-data) — always for the signed-in user
     if (req.method === 'POST' && urlPath === '/api/avatar/upload') {
-      handleAvatarUpload(req, res, avatarDir);
+      const auth = await authorise(req, res, { allowService: true });
+      if (!auth) return;
+      await handleAvatarUpload(req, res, auth, identity, avatarDir);
       return;
     }
 
-    // POST /api/avatar/remove
+    // POST /api/avatar/remove — always for the signed-in user
     if (req.method === 'POST' && urlPath === '/api/avatar/remove') {
-      handleAvatarRemove(req, res);
+      const auth = await authorise(req, res, { allowService: true });
+      if (!auth) return;
+      try {
+        let fields = {};
+        if (!auth.record) {
+          const body = await readBody(req, 4096);
+          try { fields = JSON.parse((body || Buffer.alloc(0)).toString('utf8') || '{}') || {}; } catch (_) { fields = {}; }
+        }
+        const who = identity(auth, fields, res);
+        if (!who) return;
+        await removeAvatarPath(who.displayName);
+        sendJson(res, 200, { ok: true });
+      } catch (e) {
+        console.error('[Avatar] Remove error:', e.message);
+        sendJson(res, 500, { error: 'Remove failed' });
+      }
       return;
     }
 
     // ── Chat File Upload (proxy to Lexicon) ───────────────
-    // POST /api/chat/upload — Upload an image/GIF for chat
+    // POST /api/chat/upload — Upload an image/GIF for chat, as the signed-in user
     if (req.method === 'POST' && urlPath === '/api/chat/upload') {
-      handleChatFileUpload(req, res);
+      const auth = await authorise(req, res);
+      if (!auth) return;
+      await handleChatFileUpload(req, res, auth, identity);
       return;
     }
 
     // GET /api/chat/files/:id — Proxy file from Lexicon
     if (req.method === 'GET' && urlPath.match(/^\/api\/chat\/files\/\d+(\/thumb)?$/)) {
-      proxyChatFile(req, res, urlPath);
+      await proxyChatFile(req, res, urlPath);
       return;
     }
 
-    // ── Diagnostics API (admin only, for testing) ─────────
-    // GET /api/diag/logs — Get latest voice diagnostics
-    if (req.method === 'GET' && urlPath.startsWith('/api/diag/logs')) {
-      const lines = parseInt(req.url.split('lines=')[1] || '500');
+    // ── Diagnostics API (admin only) ─────────
+    if (req.method === 'GET' && (urlPath.startsWith('/api/diag/logs') || urlPath === '/api/diag/summary' || urlPath === '/api/diag/files')) {
+      if (!(await requireDiagAccess(req, res))) return;
       try {
         const VoiceBridge = require('./voice-bridge');
         const voiceDiag = VoiceBridge.voiceBridgeInstance?.diag;
         if (!voiceDiag) {
-          res.writeHead(503, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Voice bridge not initialized' }));
+          sendJson(res, 503, { error: 'Voice bridge not initialized' });
           return;
         }
-        const logContent = voiceDiag.getTailLogs(Math.min(lines, 5000));
-        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-        res.end(logContent);
-      } catch (e) {
-        console.error('[Diag API] Error:', e);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-      return;
-    }
-
-    // GET /api/diag/summary — Get diagnostic summary/stats
-    if (req.method === 'GET' && urlPath === '/api/diag/summary') {
-      try {
-        const VoiceBridge = require('./voice-bridge');
-        const voiceDiag = VoiceBridge.voiceBridgeInstance?.diag;
-        if (!voiceDiag) {
-          res.writeHead(503, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Voice bridge not initialized' }));
-          return;
+        if (urlPath.startsWith('/api/diag/logs')) {
+          const lines = sec.clampInt(new URL(req.url, 'http://x').searchParams.get('lines'), 1, 5000, 500);
+          res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end(voiceDiag.getTailLogs(lines));
+        } else if (urlPath === '/api/diag/summary') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(voiceDiag.exportSummary(), null, 2));
+        } else {
+          sendJson(res, 200, { files: voiceDiag.listLogFiles() });
         }
-        const summary = voiceDiag.exportSummary();
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(summary, null, 2));
       } catch (e) {
-        console.error('[Diag API] Error:', e);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-      return;
-    }
-
-    // GET /api/diag/files — List available log files
-    if (req.method === 'GET' && urlPath === '/api/diag/files') {
-      try {
-        const VoiceBridge = require('./voice-bridge');
-        const voiceDiag = VoiceBridge.voiceBridgeInstance?.diag;
-        if (!voiceDiag) {
-          res.writeHead(503, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Voice bridge not initialized' }));
-          return;
-        }
-        const files = voiceDiag.listLogFiles();
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ files }));
-      } catch (e) {
-        console.error('[Diag API] Error:', e);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
+        console.error('[Diag API] Error:', e.message);
+        sendJson(res, 500, { error: 'Internal error' });
       }
       return;
     }
@@ -188,11 +305,10 @@ function createHttpServer(publicDir) {
       try {
         const lexicon = require('./lexicon-client');
         const key = await lexicon.getVapidKey();
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ publicKey: key }));
+        sendJson(res, 200, { publicKey: key });
       } catch (e) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
+        console.error('[Push] vapid-key error:', e.message);
+        sendJson(res, 500, { error: 'Internal error' });
       }
       return;
     }
@@ -207,12 +323,18 @@ function createHttpServer(publicDir) {
     let staticPath = urlPath;
     if (staticPath === '/') staticPath = '/index.html';
 
-    const safePath = path.normalize(staticPath).replace(/^(\.\.[\/\\])+/, '');
-    const filePath = path.join(publicDir, safePath);
-
-    if (!filePath.startsWith(publicDir)) {
+    // Resolve inside the public folder (compared by relative path, so a sibling like "public-old" cannot match),
+    // and never serve dot-files such as .env or .git
+    const filePath = path.resolve(root, '.' + path.normalize('/' + staticPath));
+    const rel = path.relative(root, filePath);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) {
       res.writeHead(403, { 'Content-Type': 'text/plain' });
       res.end('Forbidden');
+      return;
+    }
+    if (rel.split(/[\\/]/).some((seg) => seg.startsWith('.'))) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Not Found');
       return;
     }
 
@@ -249,112 +371,59 @@ function createHttpServer(publicDir) {
         }
       });
     });
+  }
+
+  return http.createServer((req, res) => {
+    handle(req, res).catch((e) => {
+      console.error('[HTTP] Unhandled error:', e && e.message);
+      if (!res.headersSent) sendJson(res, 500, { error: 'Internal error' });
+      else res.end();
+    });
   });
 }
 
-module.exports = { createHttpServer };
+module.exports = { createHttpServer, parseMultipart, CSP };
 
-// ── Avatar Upload Handler (simple multipart parser) ────────
-function handleAvatarUpload(req, res, avatarDir) {
-  const contentType = req.headers['content-type'] || '';
-  if (!contentType.includes('multipart/form-data')) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Expected multipart/form-data' }));
-    return;
-  }
-
-  const boundaryMatch = contentType.match(/boundary=(.+)/);
-  if (!boundaryMatch) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'No boundary found' }));
-    return;
-  }
-
-  const chunks = [];
-  let totalSize = 0;
-
-  req.on('data', (chunk) => {
-    totalSize += chunk.length;
-    if (totalSize > MAX_AVATAR_SIZE + 4096) { // slight overhead for form fields
-      req.destroy();
+// ── Avatar Upload Handler ────────
+async function handleAvatarUpload(req, res, auth, identity, avatarDir) {
+  const parts = await readMultipart(req, res, MAX_AVATAR_SIZE);
+  if (!parts) return;
+  try {
+    const session = identity(auth, formFields(parts), res);
+    if (!session) return;
+    if (!uploadLimiter.take(`avatar:${session.loginName}`).ok) {
+      sendJson(res, 429, { error: 'Too many uploads. Try again in a minute.' });
       return;
     }
-    chunks.push(chunk);
-  });
-
-  req.on('end', async () => {
-    try {
-      const buffer = Buffer.concat(chunks);
-      const boundary = '--' + boundaryMatch[1];
-      const parts = parseMultipart(buffer, boundary);
-
-      const usernamePart = parts.find(p => p.name === 'username');
-      const userIdPart = parts.find(p => p.name === 'userId');
-      const filePart = parts.find(p => p.name === 'avatar' && p.filename);
-
-      if (!usernamePart || !filePart) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Missing username or file' }));
-        return;
-      }
-
-      const username = usernamePart.data.toString('utf8').trim();
-      const userId = userIdPart ? parseInt(userIdPart.data.toString('utf8').trim()) : null;
-      const fileType = filePart.contentType || 'image/jpeg';
-      const ext = ALLOWED_AVATAR_TYPES[fileType];
-
-      if (!ext) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Unsupported image type: ' + fileType }));
-        return;
-      }
-
-      if (filePart.data.length > MAX_AVATAR_SIZE) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'File too large. Max 2MB.' }));
-        return;
-      }
-
-      // Save file: username_timestamp.ext
-      const safeName = username.replace(/[^a-zA-Z0-9_-]/g, '_');
-      const fileName = `${safeName}_${Date.now()}${ext}`;
-      const filePath = path.join(avatarDir, fileName);
-      const avatarUrl = `/${AVATAR_DIR_NAME}/${fileName}`;
-
-      fs.writeFileSync(filePath, filePart.data);
-      await setAvatarPath(username, avatarUrl, userId);
-
-      console.log(`[Avatar] Saved ${fileName} for user ${username}`);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ avatarUrl }));
-    } catch (e) {
-      console.error('[Avatar] Upload error:', e);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Upload failed' }));
+    const filePart = parts.find((p) => p.name === 'avatar' && p.filename);
+    if (!filePart) {
+      sendJson(res, 400, { error: 'Missing file' });
+      return;
     }
-  });
-}
-
-async function handleAvatarRemove(req, res) {
-  const chunks = [];
-  req.on('data', (chunk) => chunks.push(chunk));
-  req.on('end', async () => {
-    try {
-      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      if (!body.username) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Missing username' }));
-        return;
-      }
-      await removeAvatarPath(body.username);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true }));
-    } catch (e) {
-      console.error('[Avatar] Remove error:', e);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Remove failed' }));
+    if (filePart.data.length > MAX_AVATAR_SIZE) {
+      sendJson(res, 400, { error: 'File too large. Max 2MB.' });
+      return;
     }
-  });
+    // What the bytes are decides the type and the extension, not what the client claimed
+    const realType = sec.sniffImageType(filePart.data);
+    if (!realType) {
+      sendJson(res, 400, { error: 'Unsupported image type' });
+      return;
+    }
+
+    // Save file: username_timestamp.ext — username comes from the session, not the form
+    const safeName = session.displayName.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 60) || 'user';
+    const fileName = `${safeName}_${Date.now()}${EXT_FOR_TYPE[realType]}`;
+    const avatarUrl = `/${AVATAR_DIR_NAME}/${fileName}`;
+    await fs.promises.writeFile(path.join(avatarDir, fileName), filePart.data);
+    await setAvatarPath(session.displayName, avatarUrl, session.userId);
+
+    console.log(`[Avatar] Saved ${fileName} for user ${session.displayName}`);
+    sendJson(res, 200, { avatarUrl });
+  } catch (e) {
+    console.error('[Avatar] Upload error:', e.message);
+    sendJson(res, 500, { error: 'Upload failed' });
+  }
 }
 
 /**
@@ -412,96 +481,53 @@ function parseMultipart(buffer, boundary) {
 }
 
 // ── Chat File Upload Handler (proxy to Lexicon) ────────────
-const MAX_CHAT_FILE_SIZE = 8 * 1024 * 1024; // 8MB
-const ALLOWED_CHAT_FILE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-
-function handleChatFileUpload(req, res) {
-  const contentType = req.headers['content-type'] || '';
-  if (!contentType.includes('multipart/form-data')) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Expected multipart/form-data' }));
-    return;
-  }
-
-  const boundaryMatch = contentType.match(/boundary=(.+)/);
-  if (!boundaryMatch) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'No boundary found' }));
-    return;
-  }
-
-  const chunks = [];
-  let totalSize = 0;
-
-  req.on('data', (chunk) => {
-    totalSize += chunk.length;
-    if (totalSize > MAX_CHAT_FILE_SIZE + 8192) {
-      req.destroy();
+async function handleChatFileUpload(req, res, auth, identity) {
+  const parts = await readMultipart(req, res, MAX_CHAT_FILE_SIZE);
+  if (!parts) return;
+  try {
+    const session = identity(auth, formFields(parts), res);
+    if (!session) return;
+    if (session.userId == null) {
+      sendJson(res, 403, { error: 'This account cannot upload files' });
       return;
     }
-    chunks.push(chunk);
-  });
-
-  req.on('end', async () => {
-    try {
-      const buffer = Buffer.concat(chunks);
-      const boundary = '--' + boundaryMatch[1];
-      const parts = parseMultipart(buffer, boundary);
-
-      const usernamePart = parts.find(p => p.name === 'username');
-      const userIdPart = parts.find(p => p.name === 'userId');
-      const channelIdPart = parts.find(p => p.name === 'channelId');
-      const filePart = parts.find(p => p.name === 'file' && p.filename);
-
-      if (!filePart || !userIdPart) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Missing required fields (file, userId)' }));
-        return;
-      }
-
-      const fileType = filePart.contentType || 'application/octet-stream';
-      if (!ALLOWED_CHAT_FILE_TYPES.includes(fileType)) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Unsupported file type: ' + fileType + '. Allowed: JPEG, PNG, GIF, WebP' }));
-        return;
-      }
-
-      if (filePart.data.length > MAX_CHAT_FILE_SIZE) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'File too large. Max 8MB.' }));
-        return;
-      }
-
-      const userId = parseInt(userIdPart.data.toString('utf8').trim());
-      const channelId = channelIdPart ? parseInt(channelIdPart.data.toString('utf8').trim()) : 0;
-
-      // Forward to Lexicon API
-      const lexicon = require('./lexicon-client');
-      const result = await lexicon.uploadChatFile(
-        filePart.data,
-        filePart.filename,
-        fileType,
-        userId,
-        channelId
-      );
-
-      console.log(`[Chat Upload] ${usernamePart ? usernamePart.data.toString('utf8').trim() : 'user_' + userId} uploaded ${filePart.filename} (${fileType}, ${filePart.data.length} bytes) → file ID ${result.id}`);
-
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(result));
-    } catch (e) {
-      console.error('[Chat Upload] Error:', e);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Upload failed: ' + e.message }));
+    if (!uploadLimiter.take(`chat:${session.loginName}`).ok) {
+      sendJson(res, 429, { error: 'Too many uploads. Try again in a minute.' });
+      return;
     }
-  });
+    const channelIdPart = parts.find((p) => p.name === 'channelId');
+    const filePart = parts.find((p) => p.name === 'file' && p.filename);
+    if (!filePart) {
+      sendJson(res, 400, { error: 'Missing required field: file' });
+      return;
+    }
+    if (filePart.data.length > MAX_CHAT_FILE_SIZE) {
+      sendJson(res, 400, { error: 'File too large. Max 8MB.' });
+      return;
+    }
+    const realType = sec.sniffImageType(filePart.data);
+    if (!realType) {
+      sendJson(res, 400, { error: 'Unsupported file type. Allowed: JPEG, PNG, GIF, WebP' });
+      return;
+    }
+    const channelId = channelIdPart ? (sec.toId(channelIdPart.data.toString('utf8').trim()) ?? 0) : 0;
+    const filename = sec.safeFilename(filePart.filename) || `image${EXT_FOR_TYPE[realType]}`;
+
+    // Forward to Lexicon API, as the signed-in user
+    const lexicon = require('./lexicon-client');
+    const result = await lexicon.uploadChatFile(filePart.data, filename, realType, session.userId, channelId);
+
+    console.log(`[Chat Upload] ${session.displayName} uploaded ${filename} (${realType}, ${filePart.data.length} bytes) → file ID ${result.id}`);
+    sendJson(res, 200, result);
+  } catch (e) {
+    console.error('[Chat Upload] Error:', e.message);
+    sendJson(res, 500, { error: 'Upload failed' });
+  }
 }
 
 // ── Chat File Proxy (serve Lexicon files through bridge) ───
 async function proxyChatFile(req, res, urlPath) {
   try {
-    const lexicon = require('./lexicon-client');
-    const config = require('./config');
     const targetUrl = config.lexicon.apiUrl + urlPath;
 
     const proxyRes = await require('node-fetch')(targetUrl);
@@ -512,18 +538,22 @@ async function proxyChatFile(req, res, urlPath) {
       return;
     }
 
-    const ct = proxyRes.headers.get('content-type') || 'application/octet-stream';
+    // Only ever serve these as images. Anything else is forced to a download inside a sandbox, so an uploaded
+    // HTML/SVG file can never run script on this site's origin.
+    const upstreamType = (proxyRes.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    const imageType = sec.safeImageType(upstreamType);
     const buffer = await proxyRes.buffer();
 
     res.writeHead(200, {
-      'Content-Type': ct,
+      'Content-Type': imageType || 'application/octet-stream',
+      ...(imageType ? {} : { 'Content-Disposition': 'attachment' }),
+      'Content-Security-Policy': "sandbox; default-src 'none'",
       'Cache-Control': 'public, max-age=31536000, immutable',
       'Content-Length': buffer.length,
     });
     res.end(buffer);
   } catch (e) {
     console.error('[Chat File Proxy] Error:', e.message);
-    res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Could not fetch file from Lexicon' }));
+    sendJson(res, 502, { error: 'Could not fetch file from Lexicon' });
   }
 }

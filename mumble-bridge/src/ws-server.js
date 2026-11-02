@@ -5,6 +5,8 @@
 const path = require('path');
 const WebSocket = require('ws');
 const config = require('./config');
+const sec = require('./security');
+const { createSessionPersistence } = require('./database');
 const VoiceBridge = require('./voice-bridge');
 const { createHttpServer } = require('./http-server');
 const { setupMumbleListeners } = require('./mumble-relay');
@@ -29,18 +31,50 @@ class BridgeWebSocketServer {
 
     this.publicDir = path.join(__dirname, '..', 'public');
     this.voiceBridge = new VoiceBridge();
+
+    // Login sessions: opaque tokens issued after a verified sign-in, kept in the bridge database so a restart
+    // does not sign everyone out.
+    this.sessions = new sec.SessionStore({
+      ttlMs: config.security.sessionTtlHours * 60 * 60 * 1000,
+      persistence: createSessionPersistence(),
+    });
+    this.maxConnectionsPerAddress = 40;
   }
 
   async start() {
     await this.voiceBridge.init();
 
-    this.httpServer = createHttpServer(this.publicDir);
+    this.httpServer = createHttpServer(this.publicDir, { sessions: this.sessions });
 
-    this.wss = new WebSocket.Server({ server: this.httpServer });
-    this.wss.on('connection', (ws, req) => {
-      console.log(`[WS] New connection from ${req.socket.remoteAddress}`);
-      this._handleNewClient(ws);
+    this.wss = new WebSocket.Server({
+      server: this.httpServer,
+      // Chat is small JSON and voice frames are tiny; refuse anything big instead of buffering it
+      maxPayload: config.security.wsMaxPayloadBytes,
+      // Only this site, the known apps and non-browser clients may open a socket (blocks other websites)
+      verifyClient: (info, done) => {
+        if (sec.originAllowed(info.origin, info.req.headers.host)) return done(true);
+        console.log(`[WS] Rejected connection from origin ${String(info.origin).slice(0, 100)}`);
+        return done(false, 403, 'Origin not allowed');
+      },
     });
+    this.wss.on('connection', (ws, req) => {
+      const ip = sec.clientIp(req);
+      let open = 0;
+      for (const info of this.clients.values()) if (info.ip === ip) open++;
+      if (open >= this.maxConnectionsPerAddress) {
+        console.log(`[WS] Too many connections from ${ip}; closing`);
+        ws.close(1013, 'Too many connections');
+        return;
+      }
+      console.log(`[WS] New connection from ${ip}`);
+      this._handleNewClient(ws, ip);
+    });
+    this.sweeper = setInterval(() => {
+      this.sessions.sweep();
+      const purge = this.sessions.persistence && this.sessions.persistence.purge;
+      if (purge) purge(Date.now()).catch(() => {});
+    }, 60 * 60 * 1000);
+    if (this.sweeper.unref) this.sweeper.unref();
 
     // Shared state object for mumble-relay
     const state = {
@@ -71,9 +105,12 @@ class BridgeWebSocketServer {
     });
   }
 
-  _handleNewClient(ws) {
-    const clientInfo = { userId: null, username: null, channelId: null, authenticated: false };
+  _handleNewClient(ws, ip = 'unknown') {
+    const clientInfo = { userId: null, username: null, channelId: null, authenticated: false, ip };
     this.clients.set(ws, clientInfo);
+    // Chat/control messages only; audio frames are binary and not counted
+    const messageLimiter = new sec.RateLimiter(150, 10000);
+    let violations = 0;
 
     // Context object passed to client-handler
     const ctx = {
@@ -86,7 +123,9 @@ class BridgeWebSocketServer {
       broadcastToChannel: (chId, msg, excludeWs) => this._broadcastToChannel(chId, msg, excludeWs),
       broadcastChannelUpdate: (channel) => this.broadcastChannelUpdate(channel),
       broadcastChannelRemove: (channelId) => this.broadcastChannelRemove(channelId),
-      sendPostAuthChannelTopUp: (cws, cclient) => this.sendPostAuthChannelTopUp(cws, cclient),
+      // Nothing is sent before sign-in; after it, the client gets the channels and users it may see
+      sendPostAuthChannelTopUp: (cws, cclient) => this.sendServerState(cws, cclient),
+      sessions: this.sessions,
     };
 
     ws.on('message', (raw, isBinary) => {
@@ -101,12 +140,20 @@ class BridgeWebSocketServer {
         }
         return;
       }
+      const limit = messageLimiter.take('m');
+      if (!limit.ok) {
+        violations++;
+        if (violations === 1) ws.send(JSON.stringify({ type: 'error', message: 'You are sending messages too quickly' }));
+        if (violations > 50) ws.close(1008, 'Rate limit exceeded');
+        return;
+      }
       try {
         const msg = JSON.parse(raw.toString());
 
         // 'command' type needs special handling — routed directly into the bot engine.
-        if (msg.type === 'command' && clientInfo.authenticated) {
-          if (this.botEngine) {
+        if (msg && msg.type === 'command' && clientInfo.authenticated) {
+          if (this.botEngine && typeof msg.command === 'string' && msg.command.length <= 64
+              && (msg.args === undefined || (Array.isArray(msg.args) && msg.args.length <= 20 && msg.args.every((a) => typeof a === 'string' && a.length <= 500)))) {
             const argsSuffix = (msg.args && msg.args.length) ? ' ' + msg.args.join(' ') : '';
             const raw = `${config.botPrefix}${msg.command}${argsSuffix}`;
             const chId = clientInfo.channelId || 0;
@@ -128,6 +175,12 @@ class BridgeWebSocketServer {
         console.error('[WS] Bad JSON from client:', err.message);
         ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
       }
+    });
+
+    // A bad frame (too big, malformed, or a dropped connection) is reported on the socket; without a handler
+    // that would surface as an uncaught exception, which one client must never be able to cause.
+    ws.on('error', (err) => {
+      console.log(`[WS] Socket error from ${clientInfo.username || ip}: ${err.message}`);
     });
 
     ws.on('close', () => {
@@ -156,26 +209,21 @@ class BridgeWebSocketServer {
       this.clients.delete(ws);
     });
 
+    // The sign-in screen needs nothing from the server, so the channel and user lists wait until the client is signed in.
+  }
+
+  /** Send a signed-in client the channels it may see (restricted ones only if it has access) and the Mumble users. */
+  sendServerState(ws, client) {
     const accessFeature = featureRegistry.features?.get('channel-access');
+    const all = Array.from(this.channels.values());
     const visibleChannels = accessFeature
-      ? accessFeature.filterVisibleChannels(Array.from(this.channels.values()), null, false)
-      : Array.from(this.channels.values());
+      ? accessFeature.filterVisibleChannels(all, client.userId, client.isAdmin)
+      : all;
     ws.send(JSON.stringify({
       type: 'server_state',
       channels: visibleChannels,
       users: Array.from(this.users.values()),
     }));
-  }
-
-  /** Send this specific client the restricted channels it can see but wasn't sent pre-auth. */
-  sendPostAuthChannelTopUp(ws, client) {
-    const accessFeature = featureRegistry.features?.get('channel-access');
-    if (!accessFeature) return;
-    const extra = Array.from(this.channels.values())
-      .filter((ch) => accessFeature.isRestricted(ch.id) && accessFeature.canAccess(ch.id, client.userId, client.isAdmin));
-    if (extra.length > 0) {
-      ws.send(JSON.stringify({ type: 'server_state', channels: extra, users: [] }));
-    }
   }
 
   _broadcastAll(msg) {

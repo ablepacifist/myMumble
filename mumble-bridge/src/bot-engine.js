@@ -2,6 +2,9 @@ const config = require('./config');
 const lexicon = require('./lexicon-client');
 const { getBridgePool } = require('./database');
 const musicBot = require('./music-bot');
+// Bot replies are HTML (Mumble renders it, and web clients show it), so anything that came from a user, a
+// media title or an error message is escaped before it goes in.
+const { escapeHtml: esc } = require('./security');
 
 /**
  * Bot engine — parses ! commands from text messages.
@@ -100,10 +103,10 @@ class BotEngine {
           break;
 
         default:
-          response = `Unknown command: <b>${command}</b>. Type <b>${this.prefix}help</b> for a list.`;
+          response = `Unknown command: <b>${esc(command)}</b>. Type <b>${this.prefix}help</b> for a list.`;
       }
     } catch (err) {
-      response = `Error: ${err.message}`;
+      response = `Error: ${esc(err.message)}`;
     }
 
     // Log the command
@@ -157,7 +160,7 @@ class BotEngine {
       return '🎵 Nothing is currently playing.';
     }
     const media = state.state.currentMedia;
-    return `🎵 <b>Now Playing:</b> ${media.title || media.filename}<br/>Type: ${media.mediaType || 'Unknown'}`;
+    return `🎵 <b>Now Playing:</b> ${esc(media.title || media.filename)}<br/>Type: ${esc(media.mediaType || 'Unknown')}`;
   }
 
   async _showQueue() {
@@ -168,7 +171,7 @@ class BotEngine {
     let text = `<b>📋 Music Queue (${data.queue.length} items):</b><br/>`;
     for (const [i, item] of data.queue.slice(0, 10).entries()) {
       const title = item.mediaFile?.title || item.mediaFile?.filename || `Media #${item.mediaFileId}`;
-      text += `${i + 1}. ${title}<br/>`;
+      text += `${i + 1}. ${esc(title)}<br/>`;
     }
     if (data.queue.length > 10) text += `... and ${data.queue.length - 10} more.`;
     return text;
@@ -180,7 +183,7 @@ class BotEngine {
     const query = args.join(' ');
     const results = await lexicon.searchMedia(query);
 
-    if (!results.length) return `❌ No results for: <b>${query}</b>`;
+    if (!results.length) return `❌ No results for: <b>${esc(query)}</b>`;
 
     // Queue the first result. Note: this doesn't necessarily start playing
     // immediately — it may land behind other queued items.
@@ -189,11 +192,11 @@ class BotEngine {
     try {
       await lexicon.queueToLivestream(userId, media.id);
     } catch (err) {
-      return `❌ Failed to queue: ${err.message}`;
+      return `❌ Failed to queue: ${esc(err.message)}`;
     }
 
     if (senderChannelId === null || senderChannelId === undefined) {
-      return `✅ Queued: <b>${title}</b> — join a voice channel to hear it play!`;
+      return `✅ Queued: <b>${esc(title)}</b> — join a voice channel to hear it play!`;
     }
 
     let result;
@@ -203,9 +206,9 @@ class BotEngine {
       result = { ok: false, error: err.message };
     }
     if (!result.ok) {
-      return `✅ Queued: <b>${title}</b> (⚠️ couldn't join voice: ${result.error})`;
+      return `✅ Queued: <b>${esc(title)}</b> (⚠️ couldn't join voice: ${esc(result.error)})`;
     }
-    return result.moved ? `✅ Queued: <b>${title}</b> — 🎵 moved to your channel!` : `✅ Queued: <b>${title}</b>`;
+    return result.moved ? `✅ Queued: <b>${esc(title)}</b> — 🎵 moved to your channel!` : `✅ Queued: <b>${esc(title)}</b>`;
   }
 
   async _skip(userId) {
@@ -213,7 +216,7 @@ class BotEngine {
       const result = await lexicon.skipLivestream(userId);
       return result.skipped ? '⏭️ Song skipped!' : `⏭️ Skip vote recorded (${result.totalVotes || '?'} votes).`;
     } catch (err) {
-      return `❌ Skip failed: ${err.message}`;
+      return `❌ Skip failed: ${esc(err.message)}`;
     }
   }
 
@@ -235,11 +238,11 @@ class BotEngine {
     const query = args.join(' ');
     const results = await lexicon.searchMedia(query);
 
-    if (!results.length) return `❌ No results for: <b>${query}</b>`;
+    if (!results.length) return `❌ No results for: <b>${esc(query)}</b>`;
 
-    let text = `<b>🔍 Search results for "${query}":</b><br/>`;
+    let text = `<b>🔍 Search results for "${esc(query)}":</b><br/>`;
     for (const [i, media] of results.slice(0, 5).entries()) {
-      text += `${i + 1}. <b>${media.title || media.filename}</b> (${media.mediaType}) [ID: ${media.id}]<br/>`;
+      text += `${i + 1}. <b>${esc(media.title || media.filename)}</b> (${esc(media.mediaType)}) [ID: ${esc(media.id)}]<br/>`;
     }
     return text;
   }
@@ -262,7 +265,7 @@ Uptime: Running`;
     let text = `<b>👥 Online Users (${users.length}):</b><br/>`;
     for (const u of users) {
       const ch = this.wsServer.channels.get(u.channelId);
-      text += `• ${u.name} (in ${ch?.name || 'Root'})<br/>`;
+      text += `• ${esc(u.name)} (in ${esc(ch?.name || 'Root')})<br/>`;
     }
     return text;
   }
@@ -274,7 +277,7 @@ Uptime: Running`;
     let text = `<b>📢 Channels (${channels.length}):</b><br/>`;
     for (const ch of channels) {
       const userCount = Array.from(this.wsServer.users.values()).filter(u => u.channelId === ch.id).length;
-      text += `• ${ch.name} (${userCount} users)<br/>`;
+      text += `• ${esc(ch.name)} (${userCount} users)<br/>`;
     }
     return text;
   }

@@ -43,6 +43,12 @@
 
   // SSO token (from ?token= query param)
   let pendingSsoToken = null;
+  // Session token issued by the bridge after a verified sign-in. Kept per browser tab so a reload or a dropped
+  // connection can pick the session back up without asking for the password again.
+  const SESSION_KEY = 'bridgeSession';
+  let sessionToken = null;
+  try { sessionToken = window.sessionStorage.getItem(SESSION_KEY); } catch (_) { /* storage blocked */ }
+  let loginPassword = '';
 
   // Voice settings (persisted to localStorage)
   let voiceSettings = loadVoiceSettings();
@@ -53,6 +59,7 @@
   const chatScreen      = $('#chat-screen');
   const usernameInput   = $('#username-input');
   const loginBtn        = $('#login-btn');
+  const passwordInput   = $('#password-input');
   const loginError      = $('#login-error');
   const sidebar         = $('#sidebar');
   const toggleSidebar   = $('#toggle-sidebar-btn');
@@ -185,10 +192,29 @@
     return d.toLocaleDateString([], { month: '2-digit', day: '2-digit', year: 'numeric' }) + ' ' + time;
   }
 
+  // Escapes quotes as well as < > &, so the result is safe inside an attribute value too
   function escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
+    return String(str == null ? '' : str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
+
+  // Only one of our own avatar files (optionally with a cache-busting ?t=123) is ever used as an image source
+  const AVATAR_PATTERN = /^\/uploads\/avatars\/[A-Za-z0-9._-]{1,150}(\?t=\d{1,15})?$/;
+  // Chat images come from the bridge's own file route
+  const CHAT_IMAGE_PATTERN = /^(https?:\/\/[A-Za-z0-9.-]+(:\d+)?)?\/api\/chat\/files\/\d{1,12}(\/thumb)?$/;
+  function safeChatImageUrl(url) {
+    return typeof url === 'string' && CHAT_IMAGE_PATTERN.test(url) ? url : '';
+  }
+  function safeLinkUrl(url) {
+    return typeof url === 'string' && /^https?:\/\/[^\s"'<>`]+$/i.test(url) ? url : '';
+  }
+  function safeDimension(value, fallback) {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 && n < 20000 ? Math.round(n) : fallback;
   }
 
   function stripHtml(str) {
@@ -196,7 +222,8 @@
   }
 
   function getAvatarUrl(username) {
-    return avatarCache[username] || DEFAULT_AVATAR;
+    const url = avatarCache[username];
+    return typeof url === 'string' && AVATAR_PATTERN.test(url) ? url : DEFAULT_AVATAR;
   }
 
   /**
@@ -221,14 +248,12 @@
 
     // Auto-detect plain URLs and convert to clickable links.
     html = html.replace(
-      /((?:https?:\/\/|www\.)[^\s<]+[^\s<.,;:!?"')\]])/gi,
+      /((?:https?:\/\/|www\.)(?:(?!&quot;|&#039;)[^\s<])*(?!&quot;|&#039;)[^\s<.,;:!?"')\]])/gi,
       (url) => {
         const href = url.startsWith('www.') ? 'https://' + url : url;
         if (/\.(png|jpe?g|gif|webp)(\?[^\s]*)?$/i.test(url)) {
           return `<a href="${href}" target="_blank" rel="noopener noreferrer" class="chat-link">${url}</a>` +
-            `<div class="embed-image"><img src="${href}" alt="Linked image" loading="lazy" ` +
-            `onclick="window.open('${href}','_blank')" ` +
-            `onerror="this.parentElement.style.display='none'"></div>`;
+            `<div class="embed-image"><img src="${href}" alt="Linked image" loading="lazy" data-full-url="${href}"></div>`;
         }
         return `<a href="${href}" target="_blank" rel="noopener noreferrer" class="chat-link">${url}</a>`;
       }
@@ -239,8 +264,9 @@
       const idx = parseInt(idxRaw, 10);
       const entry = markdownLinks[idx];
       if (!entry) return '';
-      const href = entry.url.startsWith('www.') ? 'https://' + entry.url : entry.url;
-      return `<a href="${href}" target="_blank" rel="noopener noreferrer" class="chat-link">${escapeHtml(entry.label)}</a>`;
+      const href = safeLinkUrl(entry.url.startsWith('www.') ? 'https://' + entry.url : entry.url);
+      if (!href) return escapeHtml(entry.label);
+      return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer" class="chat-link">${escapeHtml(entry.label)}</a>`;
     });
 
     return html;
@@ -287,8 +313,11 @@
       if (pendingSsoToken) {
         ws.send(JSON.stringify({ type: 'sso_auth', token: pendingSsoToken }));
         pendingSsoToken = null;
-      } else {
-        ws.send(JSON.stringify({ type: 'auth', username }));
+      } else if (sessionToken) {
+        // Reconnect, page reload or bridge restart: continue the signed-in session
+        ws.send(JSON.stringify({ type: 'resume', sessionToken }));
+      } else if (username) {
+        ws.send(JSON.stringify({ type: 'auth', username, password: loginPassword }));
       }
     };
 
@@ -308,7 +337,22 @@
     ws.onerror = (err) => console.error('[WS] Error:', err);
   }
 
+  function forgetSession() {
+    sessionToken = null;
+    loginPassword = '';
+    try { window.sessionStorage.removeItem(SESSION_KEY); } catch (_) { /* ignore */ }
+  }
+
+  // Headers for the bridge's HTTP calls (avatar, image upload): who we are comes from the session token
+  function authHeaders(extra) {
+    return Object.assign({}, extra || {}, sessionToken ? { Authorization: 'Bearer ' + sessionToken } : {});
+  }
+
   function disconnect() {
+    if (ws && ws.readyState === WebSocket.OPEN && sessionToken) {
+      try { ws.send(JSON.stringify({ type: 'logout' })); } catch (_) { /* closing anyway */ }
+    }
+    forgetSession();
     clearTimeout(reconnectTimer);
     stopPolling();
     reconnectAttempts = MAX_RECONNECT;
@@ -351,6 +395,12 @@
   function handleMessage(msg) {
     switch (msg.type) {
       case 'auth_ok':
+        if (msg.sessionToken) {
+          sessionToken = msg.sessionToken;
+          try { window.sessionStorage.setItem(SESSION_KEY, sessionToken); } catch (_) { /* ignore */ }
+        }
+        loginPassword = '';
+        passwordInput.value = '';
         userId = msg.userId;
         username = msg.username;
         isAdmin = !!msg.isAdmin;
@@ -373,7 +423,10 @@
         break;
 
       case 'auth_error':
-        // SSO token was invalid/expired — show login screen with error
+        // Wrong password, a rejected SSO token or an ended session — back to the sign-in form with the reason
+        if (msg.sessionExpired || sessionToken) forgetSession();
+        loginPassword = '';
+        passwordInput.value = '';
         switchToLogin();
         showError(msg.message || 'Authentication failed');
         // Clean URL token param
@@ -585,8 +638,8 @@
         if (msg.avatarUrl) {
           avatarCache[msg.username || username] = msg.avatarUrl + '?t=' + Date.now();
           if (!msg.username || msg.username === username) {
-            myAvatar.src = avatarCache[username];
-            profileAvatar.src = avatarCache[username];
+            myAvatar.src = getAvatarUrl(username);
+            profileAvatar.src = getAvatarUrl(username);
           }
           renderMembers();
           renderChannels();
@@ -862,7 +915,7 @@
     }
     channelRestrictUsers.innerHTML = pendingKnownUsers.map(u => `
       <label class="checkbox-label">
-        <input type="checkbox" value="${u.userId}" ${pendingGrantedUserIds.has(u.userId) ? 'checked' : ''}>
+        <input type="checkbox" value="${escapeHtml(u.userId)}" ${pendingGrantedUserIds.has(u.userId) ? 'checked' : ''}>
         ${escapeHtml(u.displayName || u.username)}
       </label>
     `).join('');
@@ -1091,21 +1144,22 @@
     // Image/GIF attachment
     if (isImageMsg) {
       const att = msg.attachment || msg;
-      const imgUrl = att.thumbnailUrl || att.fileUrl || att.url;
-      const fullUrl = att.fileUrl || att.url || imgUrl;
+      const imgUrl = safeChatImageUrl(att.thumbnailUrl) || safeChatImageUrl(att.fileUrl) || safeChatImageUrl(att.url);
+      const fullUrl = safeChatImageUrl(att.fileUrl) || safeChatImageUrl(att.url) || imgUrl;
       if (imgUrl) {
         const maxW = 400;
-        const w = att.width ? Math.min(att.width, maxW) : maxW;
-        const h = (att.height && att.width) ? Math.round((w / att.width) * att.height) : 'auto';
+        const rawW = safeDimension(att.width, 0);
+        const rawH = safeDimension(att.height, 0);
+        const w = rawW ? Math.min(rawW, maxW) : maxW;
+        const h = (rawH && rawW) ? Math.round((w / rawW) * rawH) : 'auto';
         const isGif = att.mimeType === 'image/gif' || msg.messageType === 'GIF';
         contentHtml += `
           <div class="message-attachment">
-            <img src="${imgUrl}" alt="${escapeHtml(att.originalFilename || 'image')}"
+            <img src="${escapeHtml(imgUrl)}" alt="${escapeHtml(att.originalFilename || 'image')}"
                  class="chat-image${isGif ? ' chat-gif' : ''}"
                  style="max-width:${w}px;${h !== 'auto' ? ' height:' + h + 'px;' : ''}"
                  loading="lazy"
-                 onclick="window.open('${fullUrl || imgUrl}','_blank')"
-                 onerror="this.style.display='none'">
+                 data-full-url="${escapeHtml(fullUrl || imgUrl)}">
             ${att.originalFilename ? `<div class="attachment-filename">${escapeHtml(att.originalFilename)}</div>` : ''}
           </div>
         `;
@@ -1137,7 +1191,7 @@
     const reactionsHtml = `<div class="reactions-row" data-reactions-for="${escapeHtml(msgId)}">
       <button class="reply-btn" title="Reply" data-message-id="${escapeHtml(msgId)}">↩</button>
       ${pinBtnHtml}
-      <button class="reaction-add-btn" title="Add reaction" onclick="document.dispatchEvent(new CustomEvent('reaction:open-picker',{detail:{messageId:'${escapeHtml(msgId)}'}}))">+</button>
+      <button class="reaction-add-btn" title="Add reaction" data-message-id="${escapeHtml(msgId)}">+</button>
     </div>`;
 
     let replyPreviewHtml = '';
@@ -1471,6 +1525,30 @@
   if (replyPreviewBarCancel) replyPreviewBarCancel.addEventListener('click', cancelReply);
 
   // Event delegation: reply / pin buttons and reply-preview "jump to" clicks
+  // Clicks and load errors inside messages are handled here instead of with inline onclick/onerror attributes
+  // (inline handlers are what an attacker's message text would try to inject, and a strict CSP blocks them).
+  messagesEl.addEventListener('click', (e) => {
+    const spoiler = e.target.closest && e.target.closest('.spoiler');
+    if (spoiler) { spoiler.classList.toggle('revealed'); return; }
+    const img = e.target.closest && e.target.closest('img[data-full-url]');
+    if (img) {
+      const url = img.getAttribute('data-full-url');
+      if (safeChatImageUrl(url) || safeLinkUrl(url)) window.open(url, '_blank', 'noopener,noreferrer');
+      return;
+    }
+    const addReaction = e.target.closest && e.target.closest('.reaction-add-btn');
+    if (addReaction) {
+      document.dispatchEvent(new CustomEvent('reaction:open-picker', { detail: { messageId: addReaction.getAttribute('data-message-id') } }));
+      return;
+    }
+  });
+  messagesEl.addEventListener('error', (e) => {
+    const img = e.target;
+    if (!img || img.tagName !== 'IMG') return;
+    if (img.closest('.embed-image')) img.closest('.embed-image').style.display = 'none';
+    else if (img.classList.contains('chat-image')) img.style.display = 'none';
+  }, true);
+
   messagesEl.addEventListener('click', (e) => {
     const replyBtn = e.target.closest('.reply-btn');
     if (replyBtn) { startReply(replyBtn.dataset.messageId); return; }
@@ -1760,7 +1838,7 @@
       item.innerHTML = `
         <img class="avatar avatar-sm" src="${getAvatarUrl(conv.otherUsername)}" alt="">
         <span class="dm-username">${escapeHtml(conv.otherUsername)}</span>
-        ${unread > 0 ? `<span class="dm-unread-badge">${unread}</span>` : ''}
+        ${unread > 0 ? `<span class="dm-unread-badge">${escapeHtml(unread)}</span>` : ''}
       `;
       item.addEventListener('click', () => joinDMConversation(conv.id, conv.otherUsername));
       dmListEl.appendChild(item);
@@ -1927,8 +2005,8 @@
         const data = await res.json();
         if (data.avatarUrl) {
           avatarCache[username] = data.avatarUrl + '?t=' + Date.now();
-          myAvatar.src = avatarCache[username];
-          profileAvatar.src = avatarCache[username];
+          myAvatar.src = getAvatarUrl(username);
+          profileAvatar.src = getAvatarUrl(username);
         }
       }
     } catch (e) { console.log('[Avatar] Could not load avatar:', e); }
@@ -1941,16 +2019,14 @@
     }
     const formData = new FormData();
     formData.append('avatar', file);
-    formData.append('username', username);
-    formData.append('userId', userId);
     try {
-      const res = await fetch('/api/avatar/upload', { method: 'POST', body: formData });
+      const res = await fetch('/api/avatar/upload', { method: 'POST', headers: authHeaders(), body: formData });
       if (res.ok) {
         const data = await res.json();
         if (data.avatarUrl) {
           avatarCache[username] = data.avatarUrl + '?t=' + Date.now();
-          myAvatar.src = avatarCache[username];
-          profileAvatar.src = avatarCache[username];
+          myAvatar.src = getAvatarUrl(username);
+          profileAvatar.src = getAvatarUrl(username);
           renderMembers();
           renderChannels();
           // Broadcast to other users via WebSocket
@@ -1966,8 +2042,8 @@
     try {
       const res = await fetch('/api/avatar/remove', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, userId }),
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({}),
       });
       if (res.ok) {
         avatarCache[username] = DEFAULT_AVATAR;
@@ -2002,11 +2078,9 @@
 
       const formData = new FormData();
       formData.append('file', file);
-      formData.append('username', username);
-      formData.append('userId', String(userId));
       formData.append('channelId', String(currentChannelId));
 
-      const res = await fetch('/api/chat/upload', { method: 'POST', body: formData });
+      const res = await fetch('/api/chat/upload', { method: 'POST', headers: authHeaders(), body: formData });
       if (!res.ok) {
         const errBody = await res.text();
         throw new Error(errBody || ('Upload failed: ' + res.status));
@@ -2185,10 +2259,17 @@
     if (!name) { showError('Please enter a username'); return; }
     if (name.length < 2) { showError('Username must be at least 2 characters'); return; }
     username = name;
+    loginPassword = passwordInput.value;
     reconnectAttempts = 0;
-    connect();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      // Still connected from an earlier failed attempt: sign in over the same connection
+      ws.send(JSON.stringify({ type: 'auth', username, password: loginPassword }));
+    } else {
+      connect();
+    }
   });
   usernameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') loginBtn.click(); });
+  passwordInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') loginBtn.click(); });
 
   // Chat
   sendBtn.addEventListener('click', sendMessage);
@@ -2597,6 +2678,9 @@
         window.history.replaceState({}, '', window.location.pathname);
       }
       pendingSsoToken = token;
+      connect();
+    } else if (sessionToken) {
+      // A tab that was signed in before it was reloaded continues where it left off
       connect();
     }
   })();

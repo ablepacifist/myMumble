@@ -7,14 +7,25 @@ const lexicon = require('./lexicon-client');
 const featureRegistry = require('./feature-registry');
 const config = require('./config');
 
-// Prevent crashes from killing the server — log and keep running
-process.on('uncaughtException', (err) => {
-  console.error('[FATAL] Uncaught exception (server kept running):', err.message);
-  console.error(err.stack);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('[FATAL] Unhandled rejection (server kept running):', reason);
-});
+// An uncaught error means the process is in an unknown state, so it must not be hidden. A single stray error
+// in a request handler should not drop everyone's voice call, so the first few are logged loudly with the
+// full stack and the server keeps going; if they keep coming it is not healthy, so exit and let systemd
+// (Restart=on-failure) bring up a clean process.
+const FAULT_LIMIT = 10;
+const FAULT_WINDOW_MS = 60 * 1000;
+const faultTimes = [];
+function recordFault(kind, detail) {
+  const now = Date.now();
+  faultTimes.push(now);
+  while (faultTimes.length && now - faultTimes[0] > FAULT_WINDOW_MS) faultTimes.shift();
+  console.error(`[FATAL] ${kind} (${faultTimes.length}/${FAULT_LIMIT} in the last minute):`, detail);
+  if (faultTimes.length >= FAULT_LIMIT) {
+    console.error('[FATAL] Too many unexpected errors; exiting so the service manager restarts a clean process.');
+    process.exit(1);
+  }
+}
+process.on('uncaughtException', (err) => recordFault('Uncaught exception', err && err.stack ? err.stack : err));
+process.on('unhandledRejection', (reason) => recordFault('Unhandled rejection', reason && reason.stack ? reason.stack : reason));
 
 async function main() {
   console.log('========================================');

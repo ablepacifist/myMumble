@@ -44,6 +44,8 @@ Someone sends them a DM or @mentions them:
 Users should be able to log in once on Lexicon (https://alex-dyakin.com) and seamlessly navigate to voice chat (https://voice.alex-dyakin.com) without re-entering credentials. The bridge should validate passwords against Lexicon instead of accepting any username.
 
 ### Current State (Bridge)
+> Historical: this section describes the bridge before SSO. Today's behaviour is in [SECURITY_HARDENING.md](../SECURITY_HARDENING.md).
+
 - Bridge auth is username-only (no password validation)
 - Any username connects; a Lexicon user is auto-created if not found
 - Sessions are WebSocket-lifetime only (disconnect = logged out)

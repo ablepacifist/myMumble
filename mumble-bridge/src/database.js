@@ -109,7 +109,47 @@ async function initBridgeDatabase() {
     )
   `);
 
+  // Login sessions (only a SHA-256 of each token is stored), so a bridge restart does not sign everyone out
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS bridge_sessions (
+      token_hash CHAR(64) PRIMARY KEY,
+      user_id INT NULL,
+      login_name VARCHAR(255) NOT NULL,
+      display_name VARCHAR(255) NOT NULL,
+      strong BOOLEAN NOT NULL DEFAULT FALSE,
+      expires_at BIGINT NOT NULL,
+      INDEX idx_expires (expires_at)
+    )
+  `);
+
   console.log('[DB] Bridge database tables initialized');
+}
+
+/** SessionStore persistence adapter backed by the bridge database. */
+function createSessionPersistence() {
+  return {
+    async save(hash, r) {
+      await getBridgePool().execute(
+        `INSERT INTO bridge_sessions (token_hash, user_id, login_name, display_name, strong, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE expires_at = VALUES(expires_at)`,
+        [hash, r.userId ?? null, r.loginName, r.displayName, r.strong ? 1 : 0, r.expiresAt]
+      );
+    },
+    async load(hash) {
+      const [rows] = await getBridgePool().execute(
+        'SELECT user_id, login_name, display_name, strong, expires_at FROM bridge_sessions WHERE token_hash = ?', [hash]);
+      if (!rows.length) return null;
+      const r = rows[0];
+      return { userId: r.user_id, loginName: r.login_name, displayName: r.display_name, strong: !!r.strong, expiresAt: Number(r.expires_at) };
+    },
+    async remove(hash) {
+      await getBridgePool().execute('DELETE FROM bridge_sessions WHERE token_hash = ?', [hash]);
+    },
+    async purge(nowMs) {
+      await getBridgePool().execute('DELETE FROM bridge_sessions WHERE expires_at <= ?', [nowMs]);
+    },
+  };
 }
 
 /**
@@ -141,4 +181,4 @@ async function removeAvatarPath(username) {
   await pool.execute('UPDATE user_profiles SET avatar_path = NULL WHERE username = ?', [username]);
 }
 
-module.exports = { getMumblePool, getBridgePool, initBridgeDatabase, getAvatarPath, setAvatarPath, removeAvatarPath };
+module.exports = { getMumblePool, getBridgePool, initBridgeDatabase, createSessionPersistence, getAvatarPath, setAvatarPath, removeAvatarPath };

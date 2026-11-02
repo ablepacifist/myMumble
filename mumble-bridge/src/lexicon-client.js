@@ -103,6 +103,45 @@ class LexiconClient {
   }
 
   /**
+   * Check a visitor's Lexicon username + password without keeping anything: the login Lexicon creates is
+   * closed again straight away. Lexicon applies its own failed-password slowdown on top of the bridge's.
+   * @returns {{ok:true, player:object}|{ok:false, status:number, retryAfterSec?:number}}
+   */
+  async verifyCredentials(username, password) {
+    let res;
+    try {
+      res = await this.withTimeout(fetch(`${this.baseUrl}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      }), 'Lexicon credential check');
+    } catch (err) {
+      return { ok: false, status: 503 };
+    }
+    if (!res.ok) {
+      const retry = parseInt(res.headers.get('retry-after') || '', 10);
+      return { ok: false, status: res.status, retryAfterSec: Number.isFinite(retry) ? retry : undefined };
+    }
+    let data;
+    try { data = await res.json(); } catch (_) { return { ok: false, status: 502 }; }
+
+    // Close the session Lexicon just opened; we only needed the yes/no and the identity
+    const cookies = res.headers.raw()['set-cookie'] || [];
+    const sid = cookies.map((c) => c.match(/JSESSIONID=([^;]+)/)).find(Boolean);
+    if (sid) {
+      fetch(`${this.baseUrl}/api/auth/logout`, { method: 'POST', headers: { Cookie: `JSESSIONID=${sid[1]}` } }).catch(() => {});
+    }
+    return {
+      ok: true,
+      player: {
+        id: data.id ?? data.playerId,
+        username: data.username,
+        displayName: data.displayName || data.username,
+      },
+    };
+  }
+
+  /**
    * Register a new user in Lexicon. No password needed for Mumble users —
    * we generate a random one since they auth via Mumble, not Lexicon directly.
    * @param {string} username
