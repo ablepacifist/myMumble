@@ -15,10 +15,11 @@ const accounts = {
   bob: { id: 2, username: 'bob', displayName: 'Bob', password: 'bob-pass' },
   mallory: { id: 3, username: 'mallory', displayName: 'alex', password: 'mal-pass' }, // renamed her display name to the admin's
 };
-const calls = { verify: 0, create: [], history: [], stored: [], queued: [] };
+const calls = { verify: 0, verifyIps: [], create: [], history: [], stored: [], queued: [] };
 const lexiconFake = {
-  async verifyCredentials(username, password) {
+  async verifyCredentials(username, password, clientIp) {
     calls.verify++;
+    calls.verifyIps.push(clientIp);
     if (username === 'down') return { ok: false, status: 503 };
     if (username === 'locked') return { ok: false, status: 429, retryAfterSec: 42 };
     const a = accounts[String(username).toLowerCase()];
@@ -130,6 +131,14 @@ test('password sign-in verifies against Lexicon and issues a session token', asy
   assert.deepEqual(db.mappings.at(-1), [2, 'bob', 'Bob']);
   // the avatar handed to everyone is one of ours
   assert.equal(s.ws.ofType('web_users')[0].webClients[0].avatarUrl, '/uploads/avatars/Bob_9.png');
+});
+
+test('the address of the visitor is passed to Lexicon with the password check', async () => {
+  const s = session({ ip: '198.51.100.23' });
+  const before = calls.verifyIps.length;
+  await s.send({ type: 'auth', username: 'bob', password: 'bob-pass' });
+  assert.equal(calls.verifyIps.length, before + 1);
+  assert.equal(calls.verifyIps.at(-1), '198.51.100.23');
 });
 
 test('wrong, missing and oversized passwords do not sign in', async () => {

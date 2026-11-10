@@ -97,8 +97,8 @@ class BridgeWebSocketServer {
     );
 
     return new Promise((resolve) => {
-      this.httpServer.listen(config.ws.port, () => {
-        console.log(`[WS] WebSocket server listening on port ${config.ws.port}`);
+      this.httpServer.listen(config.ws.port, config.ws.host, () => {
+        console.log(`[WS] WebSocket server listening on ${config.ws.host}:${config.ws.port}`);
         console.log(`[HTTP] Web UI available at http://localhost:${config.ws.port}`);
         resolve();
       });

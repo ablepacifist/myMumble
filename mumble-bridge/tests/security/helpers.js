@@ -8,8 +8,9 @@
 
 const path = require('path');
 
-// Never read a real .env, and keep dotenv quiet
+// Never read a real .env (not the bridge's own, not the monorepo root one), and keep dotenv quiet
 process.env.DOTENV_CONFIG_QUIET = 'true';
+process.env.MASTER_ENV_FILE = '';
 
 const SRC = path.join(__dirname, '..', '..', 'src');
 

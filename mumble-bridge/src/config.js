@@ -1,8 +1,22 @@
-require('dotenv').config();
+const path = require('path');
+const dotenv = require('dotenv');
+
+// Shared settings: the full-back-end-server root .env (MASTER_ENV_FILE, which ./restart-all exports to every service)
+// is read first; the bridge's own .env then only fills in what the root file does not define. dotenv never overrides a
+// value that is already set, so the root file wins, like it does for the Spring servers and Lexi.
+// MASTER_ENV_FILE set to an empty string means "no root file" (the offline tests do that).
+const masterEnv = process.env.MASTER_ENV_FILE !== undefined
+  ? process.env.MASTER_ENV_FILE
+  : path.resolve(__dirname, '..', '..', '..', '.env');
+if (masterEnv) dotenv.config({ path: masterEnv });
+dotenv.config();
 
 module.exports = {
   ws: {
-    port: parseInt(process.env.WS_PORT) || 3080,
+    // BRIDGE_PORT is the registry name; WS_PORT is the old name and still works.
+    port: parseInt(process.env.BRIDGE_PORT) || parseInt(process.env.WS_PORT) || 3080,
+    // Only cloudflared (same machine) needs to reach the bridge, so it listens on loopback unless told otherwise.
+    host: process.env.BRIDGE_HOST || '127.0.0.1',
   },
   mumble: {
     host: process.env.MUMBLE_HOST || '127.0.0.1',
@@ -17,7 +31,8 @@ module.exports = {
     bridgeDb: process.env.MYSQL_DATABASE_BRIDGE || 'mumble_bridge',
   },
   lexicon: {
-    apiUrl: process.env.LEXICON_API_URL || 'http://localhost:36568',
+    // Lexicon runs on the same machine: talk to it directly instead of going out through Cloudflare.
+    apiUrl: process.env.LEXICON_API_URL || `http://127.0.0.1:${parseInt(process.env.LEXICON_PORT) || 36568}`,
     // Login the bridge uses for its own Lexicon API calls. Set both in .env (never commit them).
     serviceUsername: process.env.LEXICON_SERVICE_USER || '',
     servicePassword: process.env.LEXICON_SERVICE_PASSWORD || '',
@@ -30,6 +45,8 @@ module.exports = {
     channelId: process.env.DISCORD_CHANNEL_ID || '',
     syncMumbleChannelId: parseInt(process.env.DISCORD_SYNC_MUMBLE_CHANNEL_ID) || 0,
   },
+  // The music bot decodes Lexicon's audio with ffmpeg; set FFMPEG_PATH when it is not on the PATH of the process that starts the bridge.
+  ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg',
   botPrefix: process.env.BOT_COMMAND_PREFIX || '!',
   logLevel: process.env.LOG_LEVEL || 'info',
   voiceDiagEnabled: (process.env.VOICE_DIAG_ENABLED || 'false').toLowerCase() === 'true',

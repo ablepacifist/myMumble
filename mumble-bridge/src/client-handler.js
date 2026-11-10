@@ -171,7 +171,7 @@ async function handleAuth(ws, msg, client, ctx) {
   }
 
   console.log(`[WS] Auth request (password) from: ${typed}`);
-  const result = await lex.verifyCredentials(typed, password);
+  const result = await lex.verifyCredentials(typed, password, ip);
   if (!result.ok) {
     if (result.status === 429) {
       return authError(ws, `Too many failed attempts. Try again in ${result.retryAfterSec || 60} seconds.`);

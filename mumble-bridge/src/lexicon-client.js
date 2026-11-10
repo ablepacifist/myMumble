@@ -105,14 +105,19 @@ class LexiconClient {
   /**
    * Check a visitor's Lexicon username + password without keeping anything: the login Lexicon creates is
    * closed again straight away. Lexicon applies its own failed-password slowdown on top of the bridge's.
+   * When the bridge runs on the same machine as Lexicon (loopback), Lexicon believes CF-Connecting-IP, so the
+   * visitor's own address is passed on and Lexicon's slowdown counts each visitor separately instead of treating
+   * every voice sign-in as one address. From any other machine Lexicon ignores the header.
    * @returns {{ok:true, player:object}|{ok:false, status:number, retryAfterSec?:number}}
    */
-  async verifyCredentials(username, password) {
+  async verifyCredentials(username, password, clientIp) {
     let res;
+    const headers = { 'Content-Type': 'application/json' };
+    if (typeof clientIp === 'string' && /^[0-9A-Fa-f:.]{2,45}$/.test(clientIp)) headers['CF-Connecting-IP'] = clientIp;
     try {
       res = await this.withTimeout(fetch(`${this.baseUrl}/api/auth/login`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ username, password }),
       }), 'Lexicon credential check');
     } catch (err) {
