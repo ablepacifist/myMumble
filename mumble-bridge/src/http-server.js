@@ -123,7 +123,7 @@ async function readMultipart(req, res, maxFileBytes) {
  * @param {{sessions: import('./security').SessionStore}} deps
  * @returns {http.Server}
  */
-function createHttpServer(publicDir, { sessions } = {}) {
+function createHttpServer(publicDir, { sessions, lexicon: lexiconClient } = {}) {
   const root = path.resolve(publicDir);
   const avatarDir = path.join(root, AVATAR_DIR_NAME);
   fs.mkdirSync(avatarDir, { recursive: true });
@@ -177,7 +177,13 @@ function createHttpServer(publicDir, { sessions } = {}) {
     if (config.security.diagToken && sec.safeEqual(token, config.security.diagToken)) return true;
     const record = sessions ? await sessions.get(token) : null;
     if (!record) { sendJson(res, 401, { error: 'Sign in required' }); return false; }
-    if (!sec.isAdminIdentity(record, { superUsers: config.superUsers, nameOnlyAdmin: config.security.nameOnlyAdmin })) {
+    // Stored sessions carry no permissions: ask Lexicon, which decides who is admin.
+    let permissions;
+    if (record.strong && record.userId) {
+      const lex = lexiconClient || require('./lexicon-client');
+      if (typeof lex.getPermissions === 'function') permissions = await lex.getPermissions(record.userId);
+    }
+    if (!sec.isAdminIdentity({ ...record, permissions }, { superUsers: config.superUsers, nameOnlyAdmin: config.security.nameOnlyAdmin })) {
       sendJson(res, 403, { error: 'Admin only' });
       return false;
     }

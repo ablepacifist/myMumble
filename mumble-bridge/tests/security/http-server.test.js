@@ -71,6 +71,8 @@ test.before(async () => {
   stub('lexicon-client', {
     uploadChatFile: async (...args) => { uploads.push(args); return { id: 5, url: '/api/chat/files/5', mimeType: args[2] }; },
     getVapidKey: async () => 'PUBLICKEY',
+    // Lexicon decides who is admin. userId 1 ('alex') gets no answer, so SUPERUSER_NAMES is the fallback.
+    getPermissions: async (id) => ({ 11: [], 99: [], 20: ['VOICE_ADMIN', 'HOLDFAST_ADVANCE_TIME'], 21: [] }[id]),
   });
   stub('voice-bridge', { voiceBridgeInstance: { diag: { getTailLogs: (n) => `LOGS:${n}`, exportSummary: () => ({ ok: 1 }), listLogFiles: () => ['a.log'] } } });
 
@@ -80,6 +82,8 @@ test.before(async () => {
   tokens.admin = await sessions.create({ userId: 1, loginName: 'alex', displayName: 'Alex', strong: true });
   tokens.impostor = await sessions.create({ userId: 99, loginName: 'mallory', displayName: 'alex', strong: true });
   tokens.weakAdminName = await sessions.create({ userId: 98, loginName: 'alex', displayName: 'alex', strong: false });
+  tokens.lexiconAdmin = await sessions.create({ userId: 20, loginName: 'zx', displayName: 'zx', strong: true });
+  tokens.demoted = await sessions.create({ userId: 21, loginName: 'alex', displayName: 'alex', strong: true });
 
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-http-'));
   publicDir = path.join(tmp, 'public');
@@ -220,6 +224,15 @@ test('diagnostics: admin session or DIAG_TOKEN only', async () => {
   const viaToken = await raw('GET', '/api/diag/logs?lines=99999', { headers: { authorization: `Bearer ${DIAG_TOKEN}` } });
   assert.equal(viaToken.status, 200);
   assert.equal(viaToken.body.toString(), 'LOGS:5000', 'line count is clamped');
+});
+
+test('diagnostics: Lexicon permissions decide, SUPERUSER_NAMES only when Lexicon gives no answer', async () => {
+  assert.equal((await raw('GET', '/api/diag/files', { headers: auth('lexiconAdmin') })).status, 200,
+    'VOICE_ADMIN from Lexicon is enough even when not listed in SUPERUSER_NAMES');
+  assert.equal((await raw('GET', '/api/diag/files', { headers: auth('demoted') })).status, 403,
+    'an empty list from Lexicon wins over SUPERUSER_NAMES');
+  assert.equal((await raw('GET', '/api/diag/files', { headers: auth('admin') })).status, 200,
+    'no answer from Lexicon falls back to SUPERUSER_NAMES');
 });
 
 test('other methods on static paths are refused', async () => {

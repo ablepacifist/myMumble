@@ -22,9 +22,10 @@ const sweeper = setInterval(() => { loginThrottle.sweep(); authAttemptsPerAddres
 if (sweeper.unref) sweeper.unref();
 
 /**
- * Admin only for a *verified* login whose Lexicon login name is listed in SUPERUSER_NAMES. The display name is
- * user-editable and a typed name is unproven, so neither counts. The NAME_ONLY_ADMIN transition switch keeps
- * the old behaviour for legacy name-only sessions until it is turned off.
+ * Admin only for a *verified* login whose Lexicon permissions include VOICE_ADMIN (SUPERUSER_NAMES is only the
+ * fallback for when Lexicon cannot answer; see security.isAdminIdentity). The display name is user-editable and a
+ * typed name is unproven, so neither counts. The NAME_ONLY_ADMIN transition switch keeps the old behaviour for
+ * legacy name-only sessions until it is turned off.
  */
 function isAdminFor(identity) {
   return sec.isAdminIdentity(identity, { superUsers: config.superUsers, nameOnlyAdmin: config.security.nameOnlyAdmin });
@@ -51,6 +52,13 @@ function authError(ws, message, extra = {}) {
  * the socket, hand out a session token, and send the client everything it needs to start.
  */
 async function completeLogin(ws, client, ctx, identity, { sso = false, sessionToken = null } = {}) {
+  // A resumed session carries no permissions; ask Lexicon so admin always follows the player's current role.
+  if (identity.strong && identity.permissions === undefined && identity.userId) {
+    const lex = ctx.lexicon || lexicon;
+    if (typeof lex.getPermissions === 'function') {
+      identity = { ...identity, permissions: await lex.getPermissions(identity.userId) };
+    }
+  }
   client.username = identity.displayName;
   client.userId = identity.userId;
   client.loginName = identity.loginName;
@@ -189,6 +197,7 @@ async function handleAuth(ws, msg, client, ctx) {
     loginName: p.username,
     displayName: p.displayName || p.username,
     strong: true,
+    permissions: p.permissions,
   });
 }
 
@@ -214,6 +223,7 @@ async function handleSsoAuth(ws, msg, client, ctx) {
     loginName: ssoUsername,
     displayName: ssoPlayer.displayName || ssoPlayer.username || ssoUsername,
     strong: true,
+    permissions: Array.isArray(ssoResult.permissions) ? ssoResult.permissions : undefined,
   }, { sso: true });
 }
 

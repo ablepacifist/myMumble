@@ -14,7 +14,12 @@ const accounts = {
   alex: { id: 1, username: 'alex', displayName: 'Alex', password: 'right-pass' },
   bob: { id: 2, username: 'bob', displayName: 'Bob', password: 'bob-pass' },
   mallory: { id: 3, username: 'mallory', displayName: 'alex', password: 'mal-pass' }, // renamed her display name to the admin's
+  // Lexicon reports permissions for these two; the accounts above get no answer (older Lexicon), so SUPERUSER_NAMES applies
+  zx: { id: 4, username: 'zx', displayName: 'zx', password: 'zx-pass', permissions: ['HOLDFAST_ADVANCE_TIME', 'VOICE_ADMIN'] },
+  carol: { id: 5, username: 'carol', displayName: 'Carol', password: 'carol-pass', permissions: [] },
 };
+// What GET /api/permissions/{id} answers; tests change it to simulate a role change in Lexicon
+const lexiconPermissions = {};
 const calls = { verify: 0, verifyIps: [], create: [], history: [], stored: [], queued: [] };
 const lexiconFake = {
   async verifyCredentials(username, password, clientIp) {
@@ -24,12 +29,15 @@ const lexiconFake = {
     if (username === 'locked') return { ok: false, status: 429, retryAfterSec: 42 };
     const a = accounts[String(username).toLowerCase()];
     if (!a || a.password !== password) return { ok: false, status: 401 };
-    return { ok: true, player: { id: a.id, username: a.username, displayName: a.displayName } };
+    return { ok: true, player: { id: a.id, username: a.username, displayName: a.displayName, permissions: a.permissions } };
   },
   async validateSsoToken(token) {
-    const map = { 'sso-alex': 'alex', 'sso-mallory': 'mallory', 'sso-bob': 'bob' };
+    const map = { 'sso-alex': 'alex', 'sso-mallory': 'mallory', 'sso-bob': 'bob', 'sso-zx': 'zx' };
     const u = map[token];
-    return u ? { valid: true, userId: accounts[u].id, username: u, displayName: accounts[u].displayName } : { valid: false };
+    return u ? { valid: true, userId: accounts[u].id, username: u, displayName: accounts[u].displayName, permissions: accounts[u].permissions } : { valid: false };
+  },
+  async getPermissions(userId) {
+    return lexiconPermissions[userId];
   },
   async getOrCreateUser(name) {
     calls.create.push(name);
@@ -257,6 +265,35 @@ test('legacy name-only mode (transition switch): works, but is never admin unles
 test('isAdminFor follows the configured names', () => {
   assert.equal(isAdminFor({ loginName: 'alex', displayName: 'zzz', strong: true }), true);
   assert.equal(isAdminFor({ loginName: 'bob', displayName: 'alex', strong: true }), false);
+});
+
+test('Lexicon permissions make a voice admin, for password and SSO sign-in', async () => {
+  const pw = session();
+  await pw.send({ type: 'auth', username: 'zx', password: 'zx-pass' });
+  assert.equal(pw.ws.ofType('auth_ok')[0].isAdmin, true, 'zx is not in SUPERUSER_NAMES; Lexicon says VOICE_ADMIN');
+
+  const sso = session();
+  await sso.send({ type: 'sso_auth', token: 'sso-zx' });
+  assert.equal(sso.ws.ofType('auth_ok')[0].isAdmin, true);
+
+  const plain = session();
+  await plain.send({ type: 'auth', username: 'carol', password: 'carol-pass' });
+  assert.equal(plain.ws.ofType('auth_ok')[0].isAdmin, false);
+});
+
+test('a resumed session asks Lexicon, so a role change takes effect on reconnect', async () => {
+  const s = session();
+  const token = await s.ctx.sessions.create({ userId: 4, loginName: 'zx', displayName: 'zx', strong: true });
+  lexiconPermissions[4] = ['VOICE_ADMIN'];
+  await s.send({ type: 'resume', sessionToken: token });
+  assert.equal(s.client.isAdmin, true);
+
+  lexiconPermissions[4] = [];
+  const again = session();
+  again.ctx.sessions = s.ctx.sessions;
+  await again.send({ type: 'resume', sessionToken: token });
+  assert.equal(again.client.isAdmin, false, 'demoted in Lexicon means no longer admin here');
+  delete lexiconPermissions[4];
 });
 
 // ── resuming a session ────────────────────────────────────

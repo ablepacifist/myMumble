@@ -95,7 +95,7 @@ Both paths set the same session state on the socket (`authenticated`, `username`
 
 ### Roles
 - **User:** any authenticated socket.
-- **Admin ("superuser"):** `isAdmin = true` iff the resolved display name (case-insensitive) appears in the `SUPERUSER_NAMES` env var (currently 1 name configured). This is a **name match only** — it is granted by *whichever* auth path yields that name, including the password-less `auth`. See [Security Notes](#security-notes--known-issues).
+- **Admin ("superuser"):** `isAdmin = true` for a verified login (Lexicon password or SSO) whose Lexicon permissions include `VOICE_ADMIN`. Lexicon decides this from the player's role; the bridge only falls back to the `SUPERUSER_NAMES` env var (Lexicon login names) when Lexicon gives no answer. Display names and unverified name-only sessions never count (see `security.isAdminIdentity` and `docs/SECURITY_HARDENING.md`).
 - Admin-only operations: `create_channel`, `remove_channel`, `get_known_users`, `get_channel_access`, `set_channel_access`, `set_channel_discord_link`, `pin_message`, `unpin_message`.
 
 ### Channel access control (web app only)

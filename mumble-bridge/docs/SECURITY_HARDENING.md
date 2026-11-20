@@ -24,7 +24,10 @@ and Lexicon applies its own slowdown on top.
 
 ## Admin
 
-Admin means: a **verified** session whose **Lexicon login name** is in `SUPERUSER_NAMES`. A display name (which users can edit) or
+Admin means: a **verified** session whose **Lexicon permissions** include `VOICE_ADMIN` (players with the Lexicon `ADMIN`
+role). The bridge reads them from the login / SSO answer, and asks `GET /api/permissions/{id}` when a session resumes
+and for `/api/diag/*`. Only when Lexicon gives no answer does it fall back to the **Lexicon login name** being in
+`SUPERUSER_NAMES`; an empty list from Lexicon means not admin. A display name (which users can edit) or
 a typed name never makes anyone admin. `NAME_ONLY_ADMIN=true` restores the old name matching for unverified sessions only
 (transition use; avoid).
 

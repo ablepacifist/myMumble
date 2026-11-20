@@ -67,13 +67,25 @@ function sniffImageType(buf) {
   return null;
 }
 
+/** Lexicon permission that makes a player a voice-chat admin. */
+const VOICE_ADMIN = 'VOICE_ADMIN';
+
 /**
- * Admin rule shared by the socket and HTTP sides. A *verified* login (Lexicon password or SSO) is admin when its
- * Lexicon login name is listed. The display name is user-editable and a typed name is unproven, so they do not
- * count, except for legacy name-only sessions while the NAME_ONLY_ADMIN transition switch is on.
+ * Admin rule shared by the socket and HTTP sides.
+ *
+ * Lexicon decides who is admin: a *verified* login (Lexicon password or SSO) is admin when the permissions Lexicon
+ * returned for that player include VOICE_ADMIN. Only when Lexicon gave no answer at all (`permissions` missing:
+ * an older Lexicon, or it could not be reached) does the bridge fall back to its own SUPERUSER_NAMES list, so a
+ * Lexicon outage cannot lock the owner out. An empty list from Lexicon is an answer: not admin.
+ *
+ * The display name is user-editable and a typed name is unproven, so they never count, except for legacy
+ * name-only sessions while the NAME_ONLY_ADMIN transition switch is on.
  */
-function isAdminIdentity({ loginName, displayName, strong }, { superUsers, nameOnlyAdmin }) {
-  if (strong) return superUsers.includes(String(loginName || '').toLowerCase());
+function isAdminIdentity({ loginName, displayName, strong, permissions }, { superUsers, nameOnlyAdmin }) {
+  if (strong) {
+    if (Array.isArray(permissions)) return permissions.includes(VOICE_ADMIN);
+    return superUsers.includes(String(loginName || '').toLowerCase());
+  }
   return !!nameOnlyAdmin && superUsers.includes(String(displayName || '').toLowerCase());
 }
 
@@ -283,6 +295,7 @@ module.exports = {
   safeFilename,
   sniffImageType,
   isAdminIdentity,
+  VOICE_ADMIN,
   toId,
   clampInt,
   safeEqual,

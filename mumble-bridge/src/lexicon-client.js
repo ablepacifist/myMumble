@@ -142,6 +142,8 @@ class LexiconClient {
         id: data.id ?? data.playerId,
         username: data.username,
         displayName: data.displayName || data.username,
+        // Lexicon decides who may do what; undefined means this Lexicon does not report permissions yet
+        permissions: Array.isArray(data.permissions) ? data.permissions : undefined,
       },
     };
   }
@@ -606,6 +608,25 @@ class LexiconClient {
    * @param {string} token - The SSO token from Lexicon frontend
    * @returns {Promise<{valid: boolean, userId?: number, username?: string, displayName?: string}>}
    */
+  /**
+   * Ask Lexicon what a player may do (bridge-only route, needs the service token).
+   * @returns {Promise<string[]|undefined>} permission names, or undefined when Lexicon could not answer
+   */
+  async getPermissions(userId) {
+    const id = Number(userId);
+    if (!Number.isInteger(id) || id <= 0) return undefined;
+    try {
+      const res = await this.withTimeout(fetch(`${this.baseUrl}/api/permissions/${id}`), 'Lexicon permissions');
+      if (res.status === 404) return [];
+      if (!res.ok) return undefined;
+      const data = await res.json();
+      return Array.isArray(data.permissions) ? data.permissions : undefined;
+    } catch (err) {
+      console.warn(`[Lexicon] Permission lookup failed: ${err.message}`);
+      return undefined;
+    }
+  }
+
   async validateSsoToken(token) {
     try {
       const res = await this.withTimeout(fetch(`${this.baseUrl}/api/auth/sso/validate-token`, {
