@@ -390,6 +390,8 @@
   function send(obj) {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
   }
+  // For stand-alone panels (js/games.js). They can only send what any signed-in client could send.
+  window.bridgeSend = send;
 
   // ── Message Handler ──────────────────────────────────────
   function handleMessage(msg) {
@@ -410,6 +412,7 @@
         switchToChat();
         addActivityMessage(`Connected as ${username}`);
         window._chatUsername = username;
+        document.dispatchEvent(new CustomEvent('bridge:auth', { detail: { username, userId, isAdmin } }));
         send({ type: 'get_history', channelId: currentChannelId, limit: 50 });
         send({ type: 'join_channel', channelId: currentChannelId });
         send({ type: 'get_notifications', limit: 50 });
@@ -699,7 +702,12 @@
         break;
 
       default:
-        console.log('[WS] Unhandled:', msg.type, msg);
+        // Stand-alone panels (js/games.js) listen for their own message types here.
+        if (typeof msg.type === 'string' && msg.type.startsWith('games_')) {
+          document.dispatchEvent(new CustomEvent('bridge:message', { detail: msg }));
+        } else {
+          console.log('[WS] Unhandled:', msg.type, msg);
+        }
     }
   }
 

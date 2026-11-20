@@ -45,6 +45,13 @@ module.exports = {
     channelId: process.env.DISCORD_CHANNEL_ID || '',
     syncMumbleChannelId: parseInt(process.env.DISCORD_SYNC_MUMBLE_CHANNEL_ID) || 0,
   },
+  // Game server manager on this machine (gtw-games, 127.0.0.1:8790). Token is /etc/gtw-games/api-token.
+  // Leave the URL empty to switch the Servers panel off.
+  games: {
+    managerUrl: process.env.GAMES_MANAGER_URL || '',
+    managerToken: process.env.GAMES_MANAGER_TOKEN || '',
+    pollSeconds: parseInt(process.env.GAMES_POLL_SECONDS) || 15,
+  },
   // The music bot decodes Lexicon's audio with ffmpeg; set FFMPEG_PATH when it is not on the PATH of the process that starts the bridge.
   ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg',
   botPrefix: process.env.BOT_COMMAND_PREFIX || '!',

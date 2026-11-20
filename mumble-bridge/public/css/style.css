@@ -1311,3 +1311,51 @@ a:hover { text-decoration: underline; }
   0%   { background: rgba(88,101,242,.35); }
   100% { background: transparent; }
 }
+
+/* ===== GAME SERVERS PANEL (js/games.js) ===== */
+.games-panel { width: min(94vw, 480px); max-height: min(80vh, 640px); }
+.games-mem { font-weight: 400; font-size: 12px; color: var(--text-muted); }
+#games-btn.games-any-online { position: relative; }
+#games-btn.games-any-online::after {
+  content: ''; position: absolute; right: 4px; bottom: 4px; width: 7px; height: 7px;
+  border-radius: 50%; background: var(--green-primary);
+}
+.games-card { padding: 10px 14px; border-bottom: 1px solid var(--bg-accent); font-size: 13px; }
+.games-card-head { display: flex; align-items: center; gap: 8px; }
+.games-name { font-weight: 600; color: var(--header-primary); flex: 1; }
+.games-state { color: var(--text-muted); font-size: 12px; }
+.games-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--interactive-muted); flex: none; }
+.state-active .games-dot { background: var(--green-primary); }
+.state-activating .games-dot, .state-deactivating .games-dot { background: var(--text-warning); }
+.state-failed .games-dot { background: var(--red-primary); }
+.state-failed .games-state { color: var(--text-danger); }
+.games-players { margin: 4px 0 0 17px; color: var(--text-normal); }
+.games-join { margin: 4px 0 0 17px; color: var(--text-muted); }
+.games-join code { cursor: pointer; color: var(--text-link); font-family: 'JetBrains Mono', monospace; }
+.games-hint { margin-left: 17px; color: var(--text-faint); font-size: 12px; }
+.games-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0 17px; }
+.games-actions .btn[disabled] { opacity: .45; cursor: not-allowed; }
+.games-requests { padding: 6px 14px; background: var(--bg-mod-subtle); border-bottom: 1px solid var(--bg-accent); }
+.games-request { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; padding: 4px 0; font-size: 13px; }
+.games-request .games-hint { margin: 0; }
+.games-request-actions { display: flex; gap: 6px; }
+.games-console { border-top: 1px solid var(--bg-accent); display: flex; flex-direction: column; min-height: 0; }
+.games-console.hidden { display: none; }
+.games-console-head { display: flex; justify-content: space-between; align-items: center; padding: 6px 14px; font-weight: 600; font-size: 13px; }
+#games-console-out {
+  margin: 0; padding: 8px 14px; max-height: 220px; overflow: auto; background: var(--bg-tertiary);
+  font: 12px/1.4 'JetBrains Mono', monospace; color: var(--text-normal); white-space: pre-wrap; word-break: break-word;
+}
+#games-console-form.hidden { display: none; }
+#games-console-input {
+  width: 100%; box-sizing: border-box; border: none; padding: 8px 14px; background: var(--input-bg);
+  color: var(--text-normal); font: 12px 'JetBrains Mono', monospace; outline: none;
+}
+.games-toast {
+  position: fixed; left: 50%; bottom: 24px; transform: translate(-50%, 20px); opacity: 0; z-index: 1000;
+  background: var(--bg-floating); color: var(--text-normal); border: 1px solid var(--bg-accent);
+  border-left: 4px solid var(--green-primary); padding: 10px 16px; border-radius: 6px; font-size: 14px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.5); transition: opacity .25s, transform .25s; max-width: min(90vw, 480px);
+}
+.games-toast.bad { border-left-color: var(--red-primary); }
+.games-toast.show { opacity: 1; transform: translate(-50%, 0); }

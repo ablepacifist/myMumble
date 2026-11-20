@@ -17,6 +17,7 @@
     "test:stability": "node tests/test-stability.js",
     "test:live": "node tests/test-live.js",
     "test:features": "node tests/test-features-phase1.js",
+    "test:games": "node --test tests/test-game-servers.js",
     "test:channel-access": "node tests/test-channel-access.js",
     "test:channel-access:live": "node tests/test-channel-access-live.js",
     "test:phase4": "node tests/test-features-phase4.js",

@@ -65,6 +65,9 @@ async function completeLogin(ws, client, ctx, identity, { sso = false, sessionTo
   client.strong = !!identity.strong;
   client.authenticated = true;
   client.isAdmin = isAdminFor(identity);
+  // Lexicon's permission names for this player (undefined when Lexicon gave no answer). Features that need
+  // finer rights than isAdmin (game servers) read this; it is never taken from the client.
+  client.permissions = Array.isArray(identity.permissions) && identity.strong ? identity.permissions.slice() : undefined;
 
   if (!sessionToken) {
     sessionToken = await ctx.sessions.create({
