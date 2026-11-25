@@ -20,6 +20,12 @@ const accounts = {
 };
 // What GET /api/permissions/{id} answers; tests change it to simulate a role change in Lexicon
 const lexiconPermissions = {};
+// Messages already in Lexicon, for replies: 40 is in Root (0), 41 in the restricted channel 5
+const storedMessages = {
+  40: { id: 40, channelId: 0, username: 'alex', content: '<b>see you</b> at   8', messageType: 'TEXT' },
+  41: { id: 41, channelId: 5, username: 'alex', content: 'secret plans', messageType: 'TEXT' },
+  42: { id: 42, channelId: 0, username: 'carol', content: 'x'.repeat(300), messageType: 'TEXT' },
+};
 const calls = { verify: 0, verifyIps: [], create: [], history: [], stored: [], queued: [] };
 const lexiconFake = {
   async verifyCredentials(username, password, clientIp) {
@@ -44,11 +50,13 @@ const lexiconFake = {
     const a = accounts[String(name).toLowerCase()];
     return a ? { id: a.id, username: a.username, displayName: a.displayName } : { id: 50, username: name, displayName: name };
   },
-  async getChannelMessages(...args) { calls.history.push(args); return []; },
+  async getChannelMessages(...args) { calls.history.push(args); return historyRows; },
+  async getMessage(id) { return storedMessages[String(id)] || null; },
   async storeMessage(m) { calls.stored.push(m); return { messageId: 77 }; },
   async queueToLivestream(...args) { calls.queued.push(args); return { ok: true }; },
   async searchMedia() { return []; },
 };
+let historyRows = [];
 stub('lexicon-client', lexiconFake);
 
 const config = load('config');
@@ -93,6 +101,7 @@ test.beforeEach(() => {
   setSecurity();
   featureRegistry.features.clear();
   calls.create.length = calls.history.length = calls.stored.length = calls.queued.length = 0;
+  historyRows = [];
 });
 
 // ── signing in ────────────────────────────────────────────
@@ -475,4 +484,60 @@ test('a stored avatar path that is not one of ours is never handed out', async (
   const s = session();
   await s.send({ type: 'auth', username: 'spoof', password: 'p' });
   assert.equal(s.ws.ofType('web_users')[0].webClients.find((w) => w.username === 'Spoof').avatarUrl, '/uploads/avatars/default.jpg');
+});
+
+// ── replies ───────────────────────────────────────────────
+
+test('a reply carries a preview of the original to every client, and is stored as a reply', async () => {
+  const s = await signedIn();
+  await s.send({ type: 'text', channelId: 0, text: 'sounds good', replyToMessageId: '40' });
+  const m = s.ctx.broadcasts.at(-1).m;
+  assert.equal(m.replyToId, '40');
+  assert.deepEqual(m.replyTo, { id: '40', username: 'alex', text: 'see you at 8' }, 'markup stripped, spaces collapsed');
+  assert.equal(calls.stored.at(-1).replyToId, '40');
+  assert.equal(m.id, 77, 'the live copy has its Lexicon id');
+});
+
+test('native Mumble users see a quote line above a reply', async () => {
+  const s = await signedIn();
+  await s.send({ type: 'text', channelId: 0, text: 'ok', replyToMessageId: 40 });
+  assert.equal(s.mumble[0].html, '<i>↪ alex: see you at 8</i><br><b>Bob:</b> ok');
+});
+
+test('a long original is cut short in the preview', async () => {
+  const s = await signedIn();
+  await s.send({ type: 'text', channelId: 0, text: 'yes', replyToMessageId: '42' });
+  const { text } = s.ctx.broadcasts.at(-1).m.replyTo;
+  assert.equal(text.length, 140);
+  assert.ok(text.endsWith('…'));
+});
+
+test('a reply to a message in another channel, or one that does not exist, goes out as a plain message', async () => {
+  const s = await signedIn();
+  for (const target of ['41', '999', 'abc', '1; DROP TABLE']) {
+    await s.send({ type: 'text', channelId: 0, text: 'hmm', replyToMessageId: target });
+    const m = s.ctx.broadcasts.at(-1).m;
+    assert.equal(m.replyToId, null, `dropped ${target}`);
+    assert.equal(m.replyTo, null);
+    assert.equal(calls.stored.at(-1).replyToId, null);
+  }
+  assert.ok(s.mumble.every((x) => !x.html.includes('secret')), 'nothing from channel 5 leaks into the quote');
+});
+
+test('history replies come with their previews, from the batch or looked up', async () => {
+  historyRows = [
+    { id: 40, channelId: 0, username: 'alex', content: 'see you at 8' },
+    { id: 50, channelId: 0, username: 'bob', content: 'ok', replyToId: 40 },
+    { id: 51, channelId: 0, username: 'bob', content: 'and?', replyToId: 42 },
+    { id: 52, channelId: 0, username: 'bob', content: 'sneaky', replyToId: 41 },
+    { id: 53, channelId: 0, username: 'bob', content: 'plain' },
+  ];
+  const s = await signedIn();
+  await s.send({ type: 'get_history', channelId: 0 });
+  const rows = s.ws.ofType('history')[0].messages;
+  const byId = Object.fromEntries(rows.map((r) => [r.id, r]));
+  assert.deepEqual(byId[50].replyTo, { id: '40', username: 'alex', text: 'see you at 8' });
+  assert.equal(byId[51].replyTo.username, 'carol', 'original outside the batch is looked up');
+  assert.deepEqual(byId[52].replyTo, { id: '41', username: null, text: '' }, 'another channel: still marked as a reply, no text');
+  assert.equal(byId[53].replyTo, undefined);
 });

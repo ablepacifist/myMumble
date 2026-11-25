@@ -27,6 +27,10 @@
   let pollTimer = null;
   const POLL_INTERVAL = 30000;
   const seenMessageIds = new Set();
+  // Name+text fingerprints of messages shown live without an id (the bridge could not store
+  // them). When the same message later comes back from history with its id, it is matched
+  // here once and skipped instead of being shown a second time.
+  const idlessShown = new Map();
   const ACTIVITY_CHANNEL_ID = '__activity__';
   let activityMessages = [];
   let collapsedCategories = new Set(); // persisted category collapsed state
@@ -360,7 +364,7 @@
     ws = null;
     username = '';
     userId = null;
-    seenMessageIds.clear();
+    seenMessageIds.clear(); idlessShown.clear();
     webClients.clear();
     switchToLogin();
     setStatus('disconnected');
@@ -1002,7 +1006,7 @@
       updateChannelHeader();
       renderChannels();
       messagesEl.innerHTML = '';
-      seenMessageIds.clear();
+      seenMessageIds.clear(); idlessShown.clear();
       activityMessages.forEach(am => addSystemMessage(am.text, am.timestamp));
       scrollToBottom();
       stopPolling();
@@ -1020,7 +1024,7 @@
     renderDMList();
     if (!opts.skipHistory) {
       messagesEl.innerHTML = '';
-      seenMessageIds.clear();
+      seenMessageIds.clear(); idlessShown.clear();
       send({ type: 'get_history', channelId: chId, limit: 50 });
       startPolling();
     }
@@ -1057,7 +1061,7 @@
       return;
     }
     messagesEl.innerHTML = '';
-    seenMessageIds.clear();
+    seenMessageIds.clear(); idlessShown.clear();
     lastMessageAuthor = null;
     lastMessageTime = 0;
     msg.messages
@@ -1108,6 +1112,7 @@
       source: 'history',
       messageType: m.messageType || 'TEXT',
       replyToId: m.replyToId || null,
+      replyTo: m.replyTo || null,
       isPinned: !!m.isPinned,
     };
     if (m.attachment) {
@@ -1117,6 +1122,15 @@
       histMsg.text = histMsg.caption; // keep text for dedup
     }
     return histMsg;
+  }
+
+  /** True (and consumed) when an id-less live copy of this message is already on screen. */
+  function claimIdlessCopy(name, text) {
+    const fp = dedupKey(name, text);
+    const n = idlessShown.get(fp) || 0;
+    if (n <= 0) return false;
+    if (n === 1) idlessShown.delete(fp); else idlessShown.set(fp, n - 1);
+    return true;
   }
 
   function addChatMessage(msg, isHistory) {
@@ -1129,7 +1143,15 @@
       seenMessageIds.add(key);
     } else {
       if (seenMessageIds.has(key)) return;
+      if (msg.id && claimIdlessCopy(msg.username, dedupText)) {
+        seenMessageIds.add(key);
+        return;
+      }
       seenMessageIds.add(key);
+    }
+    if (!msg.id) {
+      const fp = dedupKey(msg.username, dedupText);
+      idlessShown.set(fp, (idlessShown.get(fp) || 0) + 1);
     }
 
     const author = msg.username || 'Unknown';
@@ -1202,16 +1224,21 @@
       <button class="reaction-add-btn" title="Add reaction" data-message-id="${escapeHtml(msgId)}">+</button>
     </div>`;
 
+    // The bridge sends `replyTo` ({ id, username, text }) with every reply. The local cache is
+    // only a fallback for an older bridge. `id` is null for a Discord reply whose original
+    // never passed through us: it still shows as a quote, just without a jump link.
     let replyPreviewHtml = '';
-    if (msg.replyToId) {
-      const cached = messageContentCache.get(String(msg.replyToId));
-      const targetInDom = messagesEl.querySelector(`[data-message-id="${msg.replyToId}"]`);
-      if (cached || targetInDom) {
-        const replyAuthor = cached?.username || 'Unknown';
-        const replyText = (cached?.text || '').slice(0, 100);
-        replyPreviewHtml = `<div class="reply-preview" data-jump-to="${escapeHtml(msg.replyToId)}">↩ <strong>${escapeHtml(replyAuthor)}</strong> ${escapeHtml(replyText)}</div>`;
+    if (msg.replyToId || msg.replyTo) {
+      const jumpId = (msg.replyTo && msg.replyTo.id) || msg.replyToId || null;
+      const fromServer = msg.replyTo && msg.replyTo.username ? msg.replyTo : null;
+      const cached = fromServer || (jumpId ? messageContentCache.get(String(jumpId)) : null);
+      const jumpAttr = jumpId ? ` data-jump-to="${escapeHtml(jumpId)}"` : '';
+      if (cached) {
+        const replyAuthor = cached.username || 'Unknown';
+        const replyText = (cached.text || '').slice(0, 140);
+        replyPreviewHtml = `<div class="reply-preview"${jumpAttr}>↩ <strong>${escapeHtml(replyAuthor)}</strong> ${escapeHtml(replyText)}</div>`;
       } else {
-        replyPreviewHtml = `<div class="reply-preview reply-preview-missing" data-jump-to="${escapeHtml(msg.replyToId)}">↩ Replying to a message — click to view</div>`;
+        replyPreviewHtml = `<div class="reply-preview reply-preview-missing"${jumpAttr}>↩ Replying to a message${jumpId ? ' — click to view' : ''}</div>`;
       }
     }
 
@@ -1582,7 +1609,10 @@
     }
 
     const preview = e.target.closest('.reply-preview');
-    if (preview) { jumpToMessage(currentChannelId, preview.dataset.jumpTo); return; }
+    if (preview) {
+      if (preview.dataset.jumpTo) jumpToMessage(currentChannelId, preview.dataset.jumpTo);
+      return;
+    }
   });
 
   if (jumpToLatestBtn) {
@@ -1880,7 +1910,7 @@
 
     // Clear messages and load DM history
     messagesEl.innerHTML = '';
-    seenMessageIds.clear();
+    seenMessageIds.clear(); idlessShown.clear();
     lastMessageAuthor = null;
     lastMessageTime = 0;
 

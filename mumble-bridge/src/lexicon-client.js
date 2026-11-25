@@ -358,6 +358,15 @@ class LexiconClient {
   }
 
   /**
+   * One stored message by id (for reply previews). Null when it does not exist.
+   */
+  async getMessage(messageId) {
+    const res = await fetch(`${this.baseUrl}/api/messages/${encodeURIComponent(messageId)}`);
+    if (!res.ok) return null;
+    return res.json();
+  }
+
+  /**
    * Get message history for a channel.
    */
   async getChannelMessages(channelId, limit = 50, before = null) {

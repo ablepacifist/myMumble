@@ -8,6 +8,7 @@ const sec = require('./security');
 const featureRegistry = require('./feature-registry');
 const richText = require('./features/rich-text');
 const { findMessageWindow } = require('./message-window');
+const replies = require('./reply-preview');
 
 // Only these may be sent before signing in.
 const PRE_AUTH_TYPES = new Set(['auth', 'sso_auth', 'resume']);
@@ -309,7 +310,6 @@ async function handleClientMessage(ws, msg, client, ctx) {
 
       const channelId = sec.toId(msg.channelId) ?? 0;
       const text = typeof msg.text === 'string' ? msg.text : '';
-      const replyToId = /^[0-9]+$/.test(String(msg.replyToMessageId)) ? String(msg.replyToMessageId) : null;
 
       if (!text.trim()) return;
       if (text.length > MAX_TEXT_LENGTH) {
@@ -324,8 +324,16 @@ async function handleClientMessage(ws, msg, client, ctx) {
 
       const channelName = ctx.channels.get(channelId)?.name || '';
 
+      // A reply carries a preview of the original so every client can draw it. The original
+      // must exist and be in this channel, otherwise the message goes out as a plain one.
+      const replyTo = msg.replyToMessageId != null
+        ? await replies.resolveReplyPreview(lexicon, msg.replyToMessageId, channelId)
+        : null;
+      const replyToId = replyTo ? replyTo.id : null;
+
       // Native Mumble clients render HTML, so both the name and the text are escaped
-      ctx.mumble.sendTextMessage([channelId], `<b>${sec.escapeHtml(client.username)}:</b> ${sec.escapeHtml(text)}`);
+      ctx.mumble.sendTextMessage([channelId],
+        `${replies.mumbleQuoteHtml(replyTo, sec.escapeHtml)}<b>${sec.escapeHtml(client.username)}:</b> ${sec.escapeHtml(text)}`);
 
       // Store in Lexicon
       let lexiconResult = null;
@@ -353,6 +361,7 @@ async function handleClientMessage(ws, msg, client, ctx) {
         timestamp: new Date().toISOString(),
         id: msgId,
         replyToId,
+        replyTo,
       });
 
       // Process @mentions (async, non-blocking)
@@ -385,7 +394,9 @@ async function handleClientMessage(ws, msg, client, ctx) {
       const discordFeature = featureRegistry.features?.get('discord-sync');
       if (discordFeature && discordFeature.isLinked(channelId)) {
         discordFeature.getAvatarUrlFor(client.username).then((avatarUrl) => {
-          discordFeature.relayToDiscord({ mumbleChannelId: channelId, username: client.username, avatarUrl, text });
+          discordFeature.relayToDiscord({
+            mumbleChannelId: channelId, username: client.username, avatarUrl, text, messageId: msgId, replyTo,
+          });
         }).catch(() => {});
       }
       break;
@@ -479,7 +490,7 @@ async function handleClientMessage(ws, msg, client, ctx) {
       ws.send(JSON.stringify({
         type: 'history',
         channelId: msg.channelId,
-        messages: await attachPinInfo(messages),
+        messages: await replies.attachReplyPreviews(lexicon, await attachPinInfo(messages), historyChannelId),
         _isRefresh: !!msg._isRefresh,
       }));
       break;
@@ -510,7 +521,7 @@ async function handleClientMessage(ws, msg, client, ctx) {
         channelId: jumpChannelId,
         messageId: targetId,
         found: true,
-        messages: await attachPinInfo(result.messages),
+        messages: await replies.attachReplyPreviews(lexicon, await attachPinInfo(result.messages), jumpChannelId),
       }));
       break;
     }
