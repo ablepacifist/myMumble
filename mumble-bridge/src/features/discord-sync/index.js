@@ -20,11 +20,18 @@
  * again — no notification, no re-broadcast, no re-relay back to Discord.
  * On the Discord side, `message.author.bot` is true for our own webhook
  * posts, so the single bot-author check both skips echoes and other bots.
+ *
+ * Replies: `discord_message_links` pairs each relayed message's Lexicon id with its
+ * Discord message id, in both directions. A web/app reply is posted to Discord with a
+ * quote of the original (and a jump link when the original is on Discord too); a Discord
+ * reply becomes a real reply in Lexicon when its original is known, or carries a quote
+ * of the Discord original when it is not.
  */
 
 const { Client, GatewayIntentBits, Events, WebhookClient } = require('discord.js');
 const config = require('../../config');
 const { getAvatarPath } = require('../../database');
+const replies = require('../../reply-preview');
 
 const DISCORD_MAX_LEN = 2000;
 const VOICE_APP_URL = 'https://voice.alex-dyakin.com';
@@ -38,6 +45,23 @@ function escapeHtml(text) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+}
+
+/** Escape Discord markdown in text we quote, so a quoted "*" or "_" stays literal. */
+function escapeDiscordMarkdown(text) {
+  return String(text).replace(/([\\*_~`|>\[\]()])/g, '\\$1');
+}
+
+/**
+ * The content posted to Discord for a message, with a one-line quote of the original when
+ * it is a reply. `jumpUrl` links back to the original when that is on Discord as well.
+ */
+function discordContent(text, replyTo, jumpUrl) {
+  if (!replyTo) return text;
+  const who = escapeDiscordMarkdown(replyTo.username || 'someone');
+  const quoted = escapeDiscordMarkdown(replyTo.text || '').replace(/\s+/g, ' ');
+  const link = jumpUrl ? ` ([jump](${jumpUrl}))` : '';
+  return `> ↪ **${who}**: ${quoted}${link}\n${text}`;
 }
 
 function sleep(ms) {
@@ -75,6 +99,18 @@ class DiscordSyncFeature {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         UNIQUE KEY uq_mumble_channel (mumble_channel_id),
         UNIQUE KEY uq_discord_channel (discord_channel_id)
+      )
+    `);
+
+    // Pairs Lexicon message ids with Discord message ids, so replies can cross over.
+    await deps.db.execute(`
+      CREATE TABLE IF NOT EXISTS discord_message_links (
+        lexicon_message_id BIGINT NOT NULL,
+        discord_message_id VARCHAR(32) NOT NULL,
+        mumble_channel_id INT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (lexicon_message_id),
+        UNIQUE KEY uq_discord_message (discord_message_id)
       )
     `);
 
@@ -200,37 +236,101 @@ class DiscordSyncFeature {
     }
 
     const username = message.member?.displayName || message.author.username;
-    await this.relayToMumble({ mumbleChannelId, username, text: text.trim() });
+    const replyTo = await this._replyFromDiscord(message, mumbleChannelId);
+    await this.relayToMumble({ mumbleChannelId, username, text: text.trim(), discordMessageId: message.id, replyTo });
+  }
+
+  /**
+   * The reply preview for a Discord message that replies to another. A known original
+   * (relayed through us) becomes a real Lexicon reply; an unknown one still shows as a
+   * quote, just without a link (id null).
+   */
+  async _replyFromDiscord(message, mumbleChannelId) {
+    const refId = message.reference?.messageId;
+    if (!refId) return null;
+    try {
+      const lexiconId = await this._lexiconIdForDiscord(refId);
+      if (lexiconId) {
+        const preview = await replies.resolveReplyPreview(this.deps.lexicon, lexiconId, mumbleChannelId);
+        if (preview) return preview;
+      }
+      const original = typeof message.fetchReference === 'function' ? await message.fetchReference() : null;
+      if (!original) return null;
+      const text = replies.previewText({ content: original.content || (original.attachments?.size ? '[image]' : '') });
+      return { id: null, username: original.member?.displayName || original.author?.username || 'someone', text };
+    } catch (err) {
+      console.error(`[Discord] Could not resolve reply target ${refId}: ${err.message}`);
+      return null;
+    }
+  }
+
+  async _lexiconIdForDiscord(discordMessageId) {
+    const [rows] = await this.deps.db.execute(
+      'SELECT lexicon_message_id FROM discord_message_links WHERE discord_message_id = ?', [String(discordMessageId)]);
+    return rows.length ? String(rows[0].lexicon_message_id) : null;
+  }
+
+  async _discordIdForLexicon(lexiconMessageId) {
+    const [rows] = await this.deps.db.execute(
+      'SELECT discord_message_id FROM discord_message_links WHERE lexicon_message_id = ?', [String(lexiconMessageId)]);
+    return rows.length ? String(rows[0].discord_message_id) : null;
+  }
+
+  /** Best effort: a missing pair only means a later reply shows without a jump link. */
+  async _rememberPair(lexiconMessageId, discordMessageId, mumbleChannelId) {
+    if (!replies.isMessageId(lexiconMessageId) || !discordMessageId) return;
+    try {
+      await this.deps.db.execute(
+        'INSERT IGNORE INTO discord_message_links (lexicon_message_id, discord_message_id, mumble_channel_id) VALUES (?, ?, ?)',
+        [String(lexiconMessageId), String(discordMessageId), mumbleChannelId]);
+    } catch (err) {
+      console.error(`[Discord] Could not record message pair: ${err.message}`);
+    }
   }
 
   /** Discord -> Mumble/web. Persists, broadcasts, and notifies like any other message. */
-  async relayToMumble({ mumbleChannelId, username, text }) {
+  async relayToMumble({ mumbleChannelId, username, text, discordMessageId = null, replyTo = null }) {
     if (!text) return;
     const channelId = mumbleChannelId;
     const channelName = this.deps.channels.get(channelId)?.name || '';
 
     try {
-      this.deps.mumble.sendTextMessage([channelId], `<b>[Discord] ${escapeHtml(username)}:</b> ${escapeHtml(text)}`);
+      this.deps.mumble.sendTextMessage([channelId],
+        `${replies.mumbleQuoteHtml(replyTo, escapeHtml)}<b>[Discord] ${escapeHtml(username)}:</b> ${escapeHtml(text)}`);
     } catch (err) {
       console.error(`[Discord] Failed to relay into Mumble: ${err.message}`);
     }
 
+    // Stored before the broadcast so the live copy carries Lexicon's id; clients match it
+    // against history by that id instead of showing the message twice.
+    const replyToId = replyTo?.id || null;
+    let id = null;
+    try {
+      const stored = await this.deps.lexicon.storeMessage({
+        channelId,
+        channelName,
+        userId: 0,
+        username,
+        content: text,
+        replyToId,
+      });
+      id = stored?.messageId ?? null;
+    } catch (_) {
+      // Still deliver it live.
+    }
+    if (id != null) await this._rememberPair(id, discordMessageId, channelId);
+
     this.deps.broadcastToChannel(channelId, {
       type: 'text',
       channelId,
+      id,
       username,
       text,
       source: 'discord',
       timestamp: new Date().toISOString(),
+      replyToId,
+      replyTo,
     });
-
-    this.deps.lexicon.storeMessage({
-      channelId,
-      channelName,
-      userId: 0,
-      username,
-      content: text,
-    }).catch(() => {});
 
     const notifFeature = require('../notifications');
     notifFeature.notifyMessage({
@@ -243,17 +343,31 @@ class DiscordSyncFeature {
   }
 
   /** Mumble/web -> Discord. Posts via webhook so it shows the real username + avatar. */
-  async relayToDiscord({ mumbleChannelId, username, avatarUrl, text }) {
+  async relayToDiscord({ mumbleChannelId, username, avatarUrl, text, messageId = null, replyTo = null }) {
     const link = this.linksByMumbleId.get(mumbleChannelId);
     if (!link || !link.webhook || !text) return;
-    const truncated = text.length > DISCORD_MAX_LEN ? text.slice(0, DISCORD_MAX_LEN - 1) + '…' : text;
+
+    let jumpUrl = null;
+    if (replyTo?.id) {
+      try {
+        const original = await this._discordIdForLexicon(replyTo.id);
+        const guildId = link.channel?.guildId;
+        if (original && guildId) jumpUrl = `https://discord.com/channels/${guildId}/${link.discordChannelId}/${original}`;
+      } catch (_) {
+        // Quote without a link.
+      }
+    }
+
+    const content = discordContent(text, replyTo, jumpUrl);
+    const truncated = content.length > DISCORD_MAX_LEN ? content.slice(0, DISCORD_MAX_LEN - 1) + '…' : content;
     try {
-      await link.webhook.send({
+      const sent = await link.webhook.send({
         username,
         avatarURL: avatarUrl || undefined,
         content: truncated,
         allowedMentions: { parse: [] }, // don't let bridge text accidentally ping Discord users/roles
       });
+      if (messageId != null && sent?.id) await this._rememberPair(messageId, sent.id, mumbleChannelId);
     } catch (err) {
       console.error(`[Discord] Failed to relay to Discord: ${err.message}`);
     }
@@ -415,3 +529,5 @@ class DiscordSyncFeature {
 }
 
 module.exports = new DiscordSyncFeature();
+module.exports.discordContent = discordContent;
+module.exports.escapeDiscordMarkdown = escapeDiscordMarkdown;
