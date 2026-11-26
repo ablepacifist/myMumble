@@ -105,14 +105,19 @@ class LexiconClient {
   /**
    * Check a visitor's Lexicon username + password without keeping anything: the login Lexicon creates is
    * closed again straight away. Lexicon applies its own failed-password slowdown on top of the bridge's.
+   * When the bridge runs on the same machine as Lexicon (loopback), Lexicon believes CF-Connecting-IP, so the
+   * visitor's own address is passed on and Lexicon's slowdown counts each visitor separately instead of treating
+   * every voice sign-in as one address. From any other machine Lexicon ignores the header.
    * @returns {{ok:true, player:object}|{ok:false, status:number, retryAfterSec?:number}}
    */
-  async verifyCredentials(username, password) {
+  async verifyCredentials(username, password, clientIp) {
     let res;
+    const headers = { 'Content-Type': 'application/json' };
+    if (typeof clientIp === 'string' && /^[0-9A-Fa-f:.]{2,45}$/.test(clientIp)) headers['CF-Connecting-IP'] = clientIp;
     try {
       res = await this.withTimeout(fetch(`${this.baseUrl}/api/auth/login`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ username, password }),
       }), 'Lexicon credential check');
     } catch (err) {
@@ -137,6 +142,8 @@ class LexiconClient {
         id: data.id ?? data.playerId,
         username: data.username,
         displayName: data.displayName || data.username,
+        // Lexicon decides who may do what; undefined means this Lexicon does not report permissions yet
+        permissions: Array.isArray(data.permissions) ? data.permissions : undefined,
       },
     };
   }
@@ -347,6 +354,15 @@ class LexiconClient {
       console.error(`[Lexicon] Failed to store message: ${res.status}`);
       return null;
     }
+    return res.json();
+  }
+
+  /**
+   * One stored message by id (for reply previews). Null when it does not exist.
+   */
+  async getMessage(messageId) {
+    const res = await fetch(`${this.baseUrl}/api/messages/${encodeURIComponent(messageId)}`);
+    if (!res.ok) return null;
     return res.json();
   }
 
@@ -601,6 +617,25 @@ class LexiconClient {
    * @param {string} token - The SSO token from Lexicon frontend
    * @returns {Promise<{valid: boolean, userId?: number, username?: string, displayName?: string}>}
    */
+  /**
+   * Ask Lexicon what a player may do (bridge-only route, needs the service token).
+   * @returns {Promise<string[]|undefined>} permission names, or undefined when Lexicon could not answer
+   */
+  async getPermissions(userId) {
+    const id = Number(userId);
+    if (!Number.isInteger(id) || id <= 0) return undefined;
+    try {
+      const res = await this.withTimeout(fetch(`${this.baseUrl}/api/permissions/${id}`), 'Lexicon permissions');
+      if (res.status === 404) return [];
+      if (!res.ok) return undefined;
+      const data = await res.json();
+      return Array.isArray(data.permissions) ? data.permissions : undefined;
+    } catch (err) {
+      console.warn(`[Lexicon] Permission lookup failed: ${err.message}`);
+      return undefined;
+    }
+  }
+
   async validateSsoToken(token) {
     try {
       const res = await this.withTimeout(fetch(`${this.baseUrl}/api/auth/sso/validate-token`, {

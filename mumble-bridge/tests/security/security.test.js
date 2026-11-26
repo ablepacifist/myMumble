@@ -75,6 +75,19 @@ test('isAdminIdentity: only a verified login name counts', () => {
   assert.equal(sec.isAdminIdentity({ loginName: 'alex', strong: true }, { superUsers: [], nameOnlyAdmin: true }), false);
 });
 
+test('isAdminIdentity: Lexicon permissions decide for verified logins', () => {
+  const cfg = { superUsers: ['alex'], nameOnlyAdmin: false };
+  assert.equal(sec.isAdminIdentity({ loginName: 'zx', strong: true, permissions: ['VOICE_ADMIN'] }, cfg), true);
+  assert.equal(sec.isAdminIdentity({ loginName: 'alex', strong: true, permissions: [] }, cfg), false,
+    'an answer from Lexicon beats SUPERUSER_NAMES');
+  assert.equal(sec.isAdminIdentity({ loginName: 'zx', strong: true, permissions: ['HOLDFAST_DELETE'] }, cfg), false,
+    'other permissions do not make a voice admin');
+  assert.equal(sec.isAdminIdentity({ loginName: 'alex', strong: true, permissions: undefined }, cfg), true,
+    'no answer from Lexicon falls back to SUPERUSER_NAMES');
+  assert.equal(sec.isAdminIdentity({ loginName: 'zx', displayName: 'zx', strong: false, permissions: ['VOICE_ADMIN'] }, cfg), false,
+    'an unverified session never gets admin from a permissions list');
+});
+
 test('originAllowed: this site, known apps, and no-Origin clients; not other websites', () => {
   assert.equal(sec.originAllowed(undefined, 'voice.alex-dyakin.com'), true);
   assert.equal(sec.originAllowed('https://voice.alex-dyakin.com', 'x'), true);

@@ -105,6 +105,7 @@
             <span id="notif-badge" class="notif-badge hidden">0</span>
           </button>
           <button id="pins-btn" class="header-btn" title="Pinned Messages">📌</button>
+          <button id="games-btn" class="header-btn" title="Game servers">🎮</button>
           <button id="search-btn" class="header-btn" title="Search messages">🔍</button>
           <button id="header-voice-btn" class="header-btn" title="Join voice chat">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
@@ -129,6 +130,21 @@
       <div id="pins-panel" class="notif-panel pins-panel hidden">
         <div class="notif-panel-header"><span>Pinned Messages</span></div>
         <div id="pins-list" class="notif-list"></div>
+      </div>
+
+      <!-- Game servers panel (js/games.js) -->
+      <div id="games-panel" class="notif-panel games-panel hidden">
+        <div class="notif-panel-header">
+          <span>Game Servers</span>
+          <span id="games-mem" class="games-mem"></span>
+        </div>
+        <div id="games-requests" class="games-requests hidden"></div>
+        <div id="games-list" class="notif-list"><div class="notif-empty">Loading…</div></div>
+        <div id="games-console" class="games-console hidden">
+          <div class="games-console-head"><span id="games-console-title"></span><button id="games-console-close" class="btn btn-small">Close</button></div>
+          <pre id="games-console-out"></pre>
+          <form id="games-console-form"><input id="games-console-input" placeholder="Console command (admin)" maxlength="500" autocomplete="off"></form>
+        </div>
       </div>
 
       <!-- Search dropdown panel -->
@@ -303,6 +319,7 @@
     <div id="reactions-mount"></div>
   <script src="/js/rich-text-renderer.js?v=1"></script>
   <script src="/js/chat.js?v=3"></script>
+  <script src="/js/games.js?v=1"></script>
   <script src="/react/features-bundle.js?v=2" defer></script>
 </body>
 </html>

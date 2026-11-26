@@ -8,6 +8,7 @@ const sec = require('./security');
 const featureRegistry = require('./feature-registry');
 const richText = require('./features/rich-text');
 const { findMessageWindow } = require('./message-window');
+const replies = require('./reply-preview');
 
 // Only these may be sent before signing in.
 const PRE_AUTH_TYPES = new Set(['auth', 'sso_auth', 'resume']);
@@ -22,9 +23,10 @@ const sweeper = setInterval(() => { loginThrottle.sweep(); authAttemptsPerAddres
 if (sweeper.unref) sweeper.unref();
 
 /**
- * Admin only for a *verified* login whose Lexicon login name is listed in SUPERUSER_NAMES. The display name is
- * user-editable and a typed name is unproven, so neither counts. The NAME_ONLY_ADMIN transition switch keeps
- * the old behaviour for legacy name-only sessions until it is turned off.
+ * Admin only for a *verified* login whose Lexicon permissions include VOICE_ADMIN (SUPERUSER_NAMES is only the
+ * fallback for when Lexicon cannot answer; see security.isAdminIdentity). The display name is user-editable and a
+ * typed name is unproven, so neither counts. The NAME_ONLY_ADMIN transition switch keeps the old behaviour for
+ * legacy name-only sessions until it is turned off.
  */
 function isAdminFor(identity) {
   return sec.isAdminIdentity(identity, { superUsers: config.superUsers, nameOnlyAdmin: config.security.nameOnlyAdmin });
@@ -51,12 +53,22 @@ function authError(ws, message, extra = {}) {
  * the socket, hand out a session token, and send the client everything it needs to start.
  */
 async function completeLogin(ws, client, ctx, identity, { sso = false, sessionToken = null } = {}) {
+  // A resumed session carries no permissions; ask Lexicon so admin always follows the player's current role.
+  if (identity.strong && identity.permissions === undefined && identity.userId) {
+    const lex = ctx.lexicon || lexicon;
+    if (typeof lex.getPermissions === 'function') {
+      identity = { ...identity, permissions: await lex.getPermissions(identity.userId) };
+    }
+  }
   client.username = identity.displayName;
   client.userId = identity.userId;
   client.loginName = identity.loginName;
   client.strong = !!identity.strong;
   client.authenticated = true;
   client.isAdmin = isAdminFor(identity);
+  // Lexicon's permission names for this player (undefined when Lexicon gave no answer). Features that need
+  // finer rights than isAdmin (game servers) read this; it is never taken from the client.
+  client.permissions = Array.isArray(identity.permissions) && identity.strong ? identity.permissions.slice() : undefined;
 
   if (!sessionToken) {
     sessionToken = await ctx.sessions.create({
@@ -171,7 +183,7 @@ async function handleAuth(ws, msg, client, ctx) {
   }
 
   console.log(`[WS] Auth request (password) from: ${typed}`);
-  const result = await lex.verifyCredentials(typed, password);
+  const result = await lex.verifyCredentials(typed, password, ip);
   if (!result.ok) {
     if (result.status === 429) {
       return authError(ws, `Too many failed attempts. Try again in ${result.retryAfterSec || 60} seconds.`);
@@ -189,6 +201,7 @@ async function handleAuth(ws, msg, client, ctx) {
     loginName: p.username,
     displayName: p.displayName || p.username,
     strong: true,
+    permissions: p.permissions,
   });
 }
 
@@ -214,6 +227,7 @@ async function handleSsoAuth(ws, msg, client, ctx) {
     loginName: ssoUsername,
     displayName: ssoPlayer.displayName || ssoPlayer.username || ssoUsername,
     strong: true,
+    permissions: Array.isArray(ssoResult.permissions) ? ssoResult.permissions : undefined,
   }, { sso: true });
 }
 
@@ -296,7 +310,6 @@ async function handleClientMessage(ws, msg, client, ctx) {
 
       const channelId = sec.toId(msg.channelId) ?? 0;
       const text = typeof msg.text === 'string' ? msg.text : '';
-      const replyToId = /^[0-9]+$/.test(String(msg.replyToMessageId)) ? String(msg.replyToMessageId) : null;
 
       if (!text.trim()) return;
       if (text.length > MAX_TEXT_LENGTH) {
@@ -311,8 +324,16 @@ async function handleClientMessage(ws, msg, client, ctx) {
 
       const channelName = ctx.channels.get(channelId)?.name || '';
 
+      // A reply carries a preview of the original so every client can draw it. The original
+      // must exist and be in this channel, otherwise the message goes out as a plain one.
+      const replyTo = msg.replyToMessageId != null
+        ? await replies.resolveReplyPreview(lexicon, msg.replyToMessageId, channelId)
+        : null;
+      const replyToId = replyTo ? replyTo.id : null;
+
       // Native Mumble clients render HTML, so both the name and the text are escaped
-      ctx.mumble.sendTextMessage([channelId], `<b>${sec.escapeHtml(client.username)}:</b> ${sec.escapeHtml(text)}`);
+      ctx.mumble.sendTextMessage([channelId],
+        `${replies.mumbleQuoteHtml(replyTo, sec.escapeHtml)}<b>${sec.escapeHtml(client.username)}:</b> ${sec.escapeHtml(text)}`);
 
       // Store in Lexicon
       let lexiconResult = null;
@@ -340,6 +361,7 @@ async function handleClientMessage(ws, msg, client, ctx) {
         timestamp: new Date().toISOString(),
         id: msgId,
         replyToId,
+        replyTo,
       });
 
       // Process @mentions (async, non-blocking)
@@ -372,7 +394,9 @@ async function handleClientMessage(ws, msg, client, ctx) {
       const discordFeature = featureRegistry.features?.get('discord-sync');
       if (discordFeature && discordFeature.isLinked(channelId)) {
         discordFeature.getAvatarUrlFor(client.username).then((avatarUrl) => {
-          discordFeature.relayToDiscord({ mumbleChannelId: channelId, username: client.username, avatarUrl, text });
+          discordFeature.relayToDiscord({
+            mumbleChannelId: channelId, username: client.username, avatarUrl, text, messageId: msgId, replyTo,
+          });
         }).catch(() => {});
       }
       break;
@@ -466,7 +490,7 @@ async function handleClientMessage(ws, msg, client, ctx) {
       ws.send(JSON.stringify({
         type: 'history',
         channelId: msg.channelId,
-        messages: await attachPinInfo(messages),
+        messages: await replies.attachReplyPreviews(lexicon, await attachPinInfo(messages), historyChannelId),
         _isRefresh: !!msg._isRefresh,
       }));
       break;
@@ -497,7 +521,7 @@ async function handleClientMessage(ws, msg, client, ctx) {
         channelId: jumpChannelId,
         messageId: targetId,
         found: true,
-        messages: await attachPinInfo(result.messages),
+        messages: await replies.attachReplyPreviews(lexicon, await attachPinInfo(result.messages), jumpChannelId),
       }));
       break;
     }

@@ -196,7 +196,7 @@ class MusicBotSession {
     if (elapsedSeconds > 1.5) args.push('-ss', String(elapsedSeconds));
     args.push('-i', url, '-vn', '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', String(SAMPLE_RATE), '-ac', String(CHANNELS), 'pipe:1');
 
-    const ff = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const ff = spawn(config.ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     this.ffmpeg = ff;
 
     let stderrTail = [];

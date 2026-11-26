@@ -81,7 +81,7 @@ function setupMumbleListeners(mumble, state, broadcastAll, broadcastToChannel, b
     broadcastAll({ type: 'user_remove', session: msg.session, name: user?.name });
   });
 
-  mumble.on('TextMessage', (msg) => {
+  const relayText = async (msg) => {
     const sender = state.users.get(msg.actor);
     const channelIds = msg.channelId || [];
     const rawText = (msg.message || '').replace(/<[^>]+>/g, '').trim();
@@ -92,25 +92,36 @@ function setupMumbleListeners(mumble, state, broadcastAll, broadcastToChannel, b
     // Skip messages from web_* voice sessions (also our bots)
     if (sender?.name && sender.name.startsWith('web_')) return;
 
+    // Stored first, so the broadcast carries Lexicon's id. Without it clients could not tell
+    // this live copy from the same message in history, and showed it twice.
+    const messageIds = new Map();
     for (const chId of channelIds) {
+      let id = null;
+      if (rawText && sender?.name) {
+        try {
+          const stored = await lexicon.storeMessage({
+            channelId: chId,
+            channelName: state.channels.get(chId)?.name || '',
+            userId: 0,
+            username: sender.name,
+            content: rawText,
+          });
+          id = stored?.messageId ?? null;
+        } catch (_) {
+          // Still deliver it live; it just has no history row to match.
+        }
+      }
+      messageIds.set(chId, id);
+
       broadcastToChannel(chId, {
         type: 'text',
         channelId: chId,
+        id,
         username: sender?.name || 'Unknown',
         text: rawText,
         source: 'mumble',
         timestamp: new Date().toISOString(),
       });
-
-      if (rawText && sender?.name) {
-        lexicon.storeMessage({
-          channelId: chId,
-          channelName: state.channels.get(chId)?.name || '',
-          userId: 0,
-          username: sender.name,
-          content: rawText,
-        }).catch(() => {});
-      }
     }
 
     // Once per message (not per delivery channel): Lexicon app notification
@@ -145,10 +156,17 @@ function setupMumbleListeners(mumble, state, broadcastAll, broadcastToChannel, b
       const discordFeature = featureRegistry.features?.get('discord-sync');
       if (discordFeature && discordFeature.isLinked(chId)) {
         discordFeature.getAvatarUrlFor(sender.name).then((avatarUrl) => {
-          discordFeature.relayToDiscord({ mumbleChannelId: chId, username: sender.name, avatarUrl, text: rawText });
+          discordFeature.relayToDiscord({
+            mumbleChannelId: chId, username: sender.name, avatarUrl, text: rawText, messageId: messageIds.get(chId) ?? null,
+          });
         }).catch(() => {});
       }
     }
+  };
+  // Async (it waits for Lexicon's id), so failures are caught here rather than left as an
+  // unhandled rejection that would take the whole bridge down.
+  mumble.on('TextMessage', (msg) => {
+    relayText(msg).catch((err) => console.error(`[Mumble] Text relay failed: ${err.message}`));
   });
 }
 

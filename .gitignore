@@ -61,3 +61,7 @@ mumble-client/dist/
 # Secrets — never track .env files
 .env
 **/.env
+
+# Voice bridge runtime files (logs; new avatar uploads, files already in git stay tracked)
+mumble-bridge/logs/
+mumble-bridge/public/uploads/

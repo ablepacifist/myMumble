@@ -24,7 +24,10 @@ and Lexicon applies its own slowdown on top.
 
 ## Admin
 
-Admin means: a **verified** session whose **Lexicon login name** is in `SUPERUSER_NAMES`. A display name (which users can edit) or
+Admin means: a **verified** session whose **Lexicon permissions** include `VOICE_ADMIN` (players with the Lexicon `ADMIN`
+role). The bridge reads them from the login / SSO answer, and asks `GET /api/permissions/{id}` when a session resumes
+and for `/api/diag/*`. Only when Lexicon gives no answer does it fall back to the **Lexicon login name** being in
+`SUPERUSER_NAMES`; an empty list from Lexicon means not admin. A display name (which users can edit) or
 a typed name never makes anyone admin. `NAME_ONLY_ADMIN=true` restores the old name matching for unverified sessions only
 (transition use; avoid).
 
@@ -59,3 +62,10 @@ ever served as images (anything else becomes a sandboxed download).
 * Content-Security-Policy on the web client, controlled by `CSP_MODE` (`report-only` default: violations are only logged in the browser
   console; set `enforce` after checking the console is clean).
 * Unexpected errors are logged with a full stack and counted; ten in a minute exits the process so systemd starts a fresh one.
+
+## Running next to Lexicon (shared settings)
+
+- **One settings file.** The bridge reads the full-back-end-server root `.env` first (the path in `MASTER_ENV_FILE`, which `./restart-all` sets for every service) and then its own `mumble-bridge/.env` for anything the root file leaves out. The root file wins, and `LEXICON_SERVICE_TOKEN` is one value shared by both sides. An empty `MASTER_ENV_FILE` means "no root file" (the offline tests do this).
+- **Loopback only.** The bridge listens on `BRIDGE_HOST` (default `127.0.0.1`); cloudflared on the same machine is the only thing that needs to reach it.
+- **Lexicon is called directly.** `LEXICON_API_URL` defaults to `http://127.0.0.1:<LEXICON_PORT>`, not through Cloudflare.
+- **Each visitor keeps their own sign-in slowdown.** When the bridge checks a password with Lexicon it passes the visitor's address as `CF-Connecting-IP`. Lexicon believes that header only from loopback, so each visitor is counted separately instead of every voice sign-in sharing the bridge's one address. Machines other than the one running Lexicon cannot use the header.
